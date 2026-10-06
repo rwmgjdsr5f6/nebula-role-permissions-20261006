@@ -5,13 +5,15 @@
 能够打开（CREATE TABLE IF NOT EXISTS 对已有表为空操作），但所有需要
 permission 列的业务操作都必须遵守既有错误协议：
 
-- grant / revoke / check（已配置成员）/ list-permissions：
+- grant / revoke / check（已配置成员）/ list-permissions /
+  list-member-permissions（已配置成员 alice，含规整后为 alice 的带空白名称）：
   退出码 1，标准输出为空，标准错误恰为 {"error":"storage_error"} 加换行，
   不附加错误详情或异常堆栈；失败后表结构与 reader 数据保持不变。
   该存储失败必须与正常业务结果明确区分：不接受成功授权、未授予、
   revoked 为 false 或空权限数组作为替代。
-- check 未配置成员（bob）：不触碰规则表查询，仍按成员未配置正常返回，
-  退出码 0，缺列不改变此结果。
+- check / list-member-permissions 未配置成员（bob）：不触碰规则表查询，
+  仍按成员未配置正常返回，退出码 0，缺列不改变此结果；不能把缺列
+  一律视为失败，也不能把 alice 的查询失败当作没有权限。
 - 名称为空或纯空白：优先判定 invalid_name，退出码 2，数据库内容不变。
 
 只依赖 Python 3 标准库与 SQLite；每个用例使用独立临时目录，结束后自动清理。
@@ -183,6 +185,103 @@ class IncompatibleSchemaTests(unittest.TestCase):
             f"输入 {argv!r}：存储失败不得输出 permissions 字段，实际为 {proc.stdout!r}",
         )
         self.assert_state_unchanged(state_before, "list-permissions 失败")
+
+    def test_list_member_permissions_configured_member_is_storage_error(self):
+        state_before = self.stored_state()
+
+        # alice 固定对应 reader，汇总必须查询规则表；缺列时是存储失败，
+        # 不得退化为空权限数组等正常汇总结果。
+        argv = ("list-member-permissions", "alice")
+        proc = self.run_rbac(*argv)
+        self.assert_storage_error(proc, argv)
+
+        self.assertNotIn(
+            "permissions",
+            proc.stdout,
+            f"输入 {argv!r}：存储失败不得输出 permissions 字段，实际为 {proc.stdout!r}",
+        )
+        self.assertNotIn(
+            "Traceback",
+            proc.stderr,
+            f"输入 {argv!r}：标准错误不得包含异常堆栈，实际为 {proc.stderr!r}",
+        )
+        self.assert_state_unchanged(state_before, "list-member-permissions 失败")
+
+    def test_list_member_permissions_trimmed_to_alice_is_storage_error(self):
+        state_before = self.stored_state()
+
+        # 成员名带首尾空白但规整后为 alice：与直接查询 alice 结果相同。
+        argv = ("list-member-permissions", "\t alice \n")
+        proc = self.run_rbac(*argv)
+        self.assert_storage_error(proc, argv)
+
+        self.assertNotIn(
+            "permissions",
+            proc.stdout,
+            f"输入 {argv!r}：存储失败不得输出 permissions 字段，实际为 {proc.stdout!r}",
+        )
+        self.assert_state_unchanged(state_before, "list-member-permissions 带空白名称")
+
+    def test_list_member_permissions_unconfigured_member_is_unaffected(self):
+        # bob 不在固定成员配置中：汇总不触碰规则表，缺列不能改变此结果；
+        # 这与 alice 的存储失败是两种必须区分的不同结果。
+        state_before = self.stored_state()
+
+        argv = ("list-member-permissions", "bob")
+        proc = self.run_rbac(*argv)
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"输入 {argv!r}：期望退出码 0，实际 {proc.returncode}，"
+            f"stdout={proc.stdout!r}，stderr={proc.stderr!r}",
+        )
+        self.assertEqual(
+            proc.stderr,
+            "",
+            f"输入 {argv!r}：成功时标准错误应为空，实际为 {proc.stderr!r}",
+        )
+        # 标准输出恰为单行紧凑 JSON 加一个换行。
+        self.assertEqual(
+            proc.stdout,
+            '{"member":"bob","roles":[],"permissions":[]}\n',
+            f"输入 {argv!r}：标准输出与预期不符，实际为 {proc.stdout!r}",
+        )
+        self.assertEqual(
+            json.loads(proc.stdout),
+            {"member": "bob", "roles": [], "permissions": []},
+            f"输入 {argv!r}：解析后的汇总结果与预期不符，实际为 {proc.stdout!r}",
+        )
+
+        self.assert_state_unchanged(state_before, "list-member-permissions 未配置成员")
+
+    def test_list_member_permissions_blank_member_is_invalid_before_storage(self):
+        state_before = self.stored_state()
+
+        # 空或纯空白成员名：即使规则库缺列，也必须优先报告 invalid_name。
+        for member in ("", "   ", "\t \n"):
+            with self.subTest(member=member):
+                argv = ("list-member-permissions", member)
+                proc = self.run_rbac(*argv)
+                self.assertEqual(
+                    proc.returncode,
+                    2,
+                    f"输入 {argv!r}：期望退出码 2，实际 {proc.returncode}，"
+                    f"stdout={proc.stdout!r}，stderr={proc.stderr!r}",
+                )
+                self.assertEqual(
+                    proc.stdout,
+                    "",
+                    f"输入 {argv!r}：invalid_name 时标准输出应为空，"
+                    f"实际为 {proc.stdout!r}",
+                )
+                self.assertEqual(
+                    proc.stderr,
+                    INVALID_NAME_ERROR,
+                    f"输入 {argv!r}：标准错误应为 {INVALID_NAME_ERROR!r}，"
+                    f"实际为 {proc.stderr!r}",
+                )
+
+        self.assert_state_unchanged(state_before, "list-member-permissions 非法名称")
 
     # ---- 同一输入上的边界行为 --------------------------------------------
 
