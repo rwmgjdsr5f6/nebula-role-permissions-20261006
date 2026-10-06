@@ -5,6 +5,7 @@
     python -m rbac --db FILE check MEMBER PERMISSION
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-member-permissions MEMBER
+    python -m rbac --db FILE list-permission-roles PERMISSION
 
 退出码约定：
 - 0：成功，标准输出为一个 JSON 对象；
@@ -62,6 +63,11 @@ def _build_parser():
         "list-member-permissions", help="汇总成员直接角色当前拥有的全部权限"
     )
     member_list_parser.add_argument("member")
+
+    permission_roles_parser = subparsers.add_parser(
+        "list-permission-roles", help="列出直接获授某权限的全部角色"
+    )
+    permission_roles_parser.add_argument("permission")
     return parser
 
 
@@ -80,6 +86,8 @@ def main(argv=None):
         raw_names = (args.role,)
     elif args.command == "list-member-permissions":
         raw_names = (args.member,)
+    elif args.command == "list-permission-roles":
+        raw_names = (args.permission,)
     else:
         raw_names = (args.member, args.permission)
 
@@ -120,6 +128,9 @@ def main(argv=None):
                     "roles": roles,
                     "permissions": permissions,
                 }
+            elif args.command == "list-permission-roles":
+                roles = store.list_roles_for_permission(conn, target_name)
+                result = {"permission": target_name, "roles": roles}
             else:
                 granted = store.permission_granted(
                     conn, policy.roles_for(target_name), permission
