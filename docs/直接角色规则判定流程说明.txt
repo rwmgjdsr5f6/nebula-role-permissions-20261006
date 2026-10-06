@@ -2,141 +2,200 @@
 ================================================
 
 文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态，
-不修改任何源码、数据或公开接口，也不依据长期目标补写任何接口或结果。
+所有示例、分支与存储边界均可对照当前源码逐一核对。本次交付仅更新本文件，
+不修改任何业务代码、测试、README 或数据格式，也不把长期规划写成已实现
+功能。
 
 核对基准
 --------
-- 仓库路径：/mnt/c/NebulaForge/projects/forge11/solverA/task002
-- 核对提交：e634a58（HEAD，分离头指针状态；仓库仅此一个提交，无其他分支）
-- 仓库全部受版本控制的文件（可用 `git ls-files` 自行核对）：
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverA/task005
+- 受版本控制的文件（可用 `git ls-files` 自行核对）：
     .gitignore
     README.md
-- 工作区根目录下除 .git 外仅有上述两个文件，没有任何 Python 源码、
-  测试、数据库文件或配置文件。
+    docs/直接角色规则判定流程说明.txt
+    rbac/__init__.py
+    rbac/__main__.py
+    rbac/policy.py
+    rbac/store.py
+    tests/test_direct_role_flow.py
+- 回归测试：在项目根目录执行 `python -m unittest discover -s tests`，
+  当前 11 个用例全部通过，覆盖本文描述的全部对外行为。
+
+与 README 的不一致说明
+---------------------
+README.md 第 5 行仍写着"当前仓库仅包含项目说明，业务功能尚未实现"。
+该表述与当前源码不一致：rbac/ 包已经实现了 grant（授权）与 check（判定）
+两个命令行子命令，并以 SQLite 持久化直接角色授权规则，tests/ 下有对应
+回归测试。README 的"计划管理""尚未实现"属于项目早期意向声明，本文以
+源码为准描述已实现的实际行为；README 本身本次不作改动。
 
 
-一、当前唯一的公开说明：README.md
----------------------------------
-README.md（第 1–6 行，全文）：
+一、公开入口与整体流程
+----------------------
+唯一公开入口是命令行：
 
-    # 本地角色权限规则库
+    python -m rbac --db FILE grant ROLE PERMISSION
+    python -m rbac --db FILE check MEMBER PERMISSION
 
-    计划管理角色、权限与访问规则。面向本地单机使用，采用 Python 3 标准库与 SQLite。
+（核对位置：rbac/__main__.py 的 _build_parser() 与 main()。）
 
-    当前仓库仅包含项目说明，业务功能尚未实现。
+一次调用从输入到输出的完整路径：
 
-关键事实：
-- 第 3 行表明项目意图是"计划管理角色、权限与访问规则"，技术选型为
-  Python 3 标准库与 SQLite。这是意向声明，不是已存在的实现。
-- 第 5 行明确声明："当前仓库仅包含项目说明，业务功能尚未实现。"
+1. 命令行输入
+   argparse 解析 --db 路径与子命令参数（grant 接收 role、permission；
+   check 接收 member、permission）。
+   核对位置：rbac/__main__.py _build_parser()、main() 开头。
 
-README 中没有任何公开入口（模块、类、函数、命令行命令）的名称或用法，
-因此"以现有 README 和公开入口为准"时，可依据的公开入口数量为零。
+2. 名称规整
+   两个名称参数先经 policy.normalize_name() 处理：去除首尾空白后按完整
+   字符串大小写敏感匹配；去除空白后为空则返回 None。main() 发现任一
+   名称为 None 即输出 invalid_name 并以退出码 2 结束，此分支不打开
+   数据库、不改动任何已有授权。
+   核对位置：rbac/policy.py normalize_name()；rbac/__main__.py main()
+   中 normalized 校验段。
 
+3. 数据库准备
+   名称全部有效后，store.connect(db_path) 打开（必要时创建）SQLite
+   规则文件，并执行 CREATE TABLE IF NOT EXISTS 确保 role_permissions
+   表（主键 (role, permission)）就绪。任何 sqlite3 层面的失败统一
+   包装为 StorageError，由 main() 输出 storage_error 并以退出码 1
+   结束。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中 try/except store.StorageError 段。
 
-二、判定流程各环节的现状（逐环节核对）
---------------------------------------
-题目所描述的判定流程为：输入进入公开入口 → 取得成员角色 → 匹配业务权限
-→ 生成允许或拒绝结果 → 表达决定原因。以下逐环节对照当前源码：
+4. 直接角色匹配
+   - grant：store.grant_permission() 以 INSERT OR IGNORE 写入
+     （角色， 权限）规则；规则已存在时不产生重复行。
+   - check：policy.roles_for(member) 从固定配置 FIXED_MEMBER_ROLES
+     取出成员的直接角色列表（当前仅 alice -> ("reader",)，未配置成员
+     得到空列表），store.permission_granted() 只读查询这些角色中是否
+     有任一直接拥有请求权限。
+   核对位置：rbac/store.py grant_permission()、permission_granted()；
+   rbac/policy.py FIXED_MEMBER_ROLES、roles_for()。
 
-1. 公开入口（接收判定请求的函数/方法/命令）
-   状态：【未实现】仓库中不存在任何 .py 文件，没有任何可导入的模块、
-   可调用的函数或可执行的命令。没有任何"输入进入"的落点。
-
-2. 取得成员角色（根据成员名查询其直接角色）
-   状态：【未实现】不存在成员表、角色表或成员-角色关联的任何代码或
-   数据结构，也没有任何查询函数。
-
-3. 匹配业务权限（判断角色是否被授予某权限）
-   状态：【未实现】不存在权限表、角色-权限规则表或匹配逻辑。
-
-4. 生成允许或拒绝结果
-   状态：【未实现】不存在判定函数，因此不存在允许/拒绝的返回类型、
-   返回值或返回约定。
-
-5. 表达决定原因
-   状态：【未实现】不存在任何原因输出（字符串、枚举、结构体均无）。
-   边界记录：当前版本没有任何"原因"内容可以解释，不是"有原因但格式
-   未知"，而是产生原因的代码尚不存在。
-
-已有流程在哪里结束：流程尚未开始。当前仓库在"项目说明"阶段结束，
-README.md 第 5 行（"业务功能尚未实现"）就是现有流程的终点。本说明
-不依据该意向补写任何接口、步骤或结果。
-
-
-三、固定示例（alice / reader / documents:read）的核对结果
----------------------------------------------------------
-题目要求的示例：合成成员 alice、角色 reader、权限 documents:read，
-演示查询已授予权限时的允许结果与查询未授予权限时的拒绝结果。
-
-核对结论：【该示例在当前版本无法建立，也无法执行】。原因逐项如下：
-
-前置状态缺失清单（每一项都因公开入口不存在而无法建立）：
-- 前置 1：创建成员 alice。缺失步骤：没有任何"添加成员"的公开入口。
-  影响：alice 无法进入任何存储，后续以其为输入的查询无从谈起。
-- 前置 2：创建角色 reader。缺失步骤：没有任何"添加角色"的公开入口。
-- 前置 3：将 alice 关联到 reader。缺失步骤：没有任何"授予角色"的
-  公开入口。
-- 前置 4：将权限 documents:read 授予角色 reader。缺失步骤：没有
-  任何"授予权限"的公开入口。
-- 前置 5：执行判定查询。缺失步骤：没有任何"查询是否允许"的公开
-  入口，因此既没有可演示的输入形式，也没有可核对的输出内容。
-
-对示例的影响：允许结果与拒绝结果两个分支都无法复现。本文不给出
-"预期输出"，因为任何写出的输出都不是当前代码的真实返回，而是虚构。
-当前真实返回是：没有可调用之物，调用本身即无从发生。
-
-关于权限名称的说明（按题目要求保留）：documents:read 在此仅表示本地
-业务规则中的一个权限名，不引申为身份认证或操作系统访问权限。当前
-版本中它只是一个字符串字面量，没有任何代码消费它。
+5. 决定输出
+   check 由 policy.decide() 生成决定：
+   - 成员无直接角色 -> allowed=false，reason="成员未配置"；
+   - 有角色且规则命中 -> allowed=true，reason="直接角色授权"；
+   - 有角色但规则未命中 -> allowed=false，reason="权限未授予"。
+   结果以紧凑分隔符的 JSON 写入标准输出并追加一个换行。
+   核对位置：rbac/policy.py decide() 及 REASON_* 常量；
+   rbac/__main__.py _emit()、_fail()。
 
 
-四、必要边界（逐条核对）
-------------------------
-1. 未找到匹配权限时的结果：【不适用 / 未实现】不存在判定函数，因此
-   不存在"未匹配时返回什么"的规定。不能凭空声明它返回 False、None
-   或抛出异常——当前没有任何代码可以支持其中任何一种说法。
+二、主流程示例（可逐条复现核对）
+--------------------------------
+前提：父目录已存在、rules.db 尚不存在。以下命令在项目根目录执行。
 
-2. 公开入口接收空名称（空字符串等）时的处理：【不适用】不存在公开
-   入口，因而不存在对空名称的接收与处理。不应凭空增加"应校验空名"
-   之类的要求；当前版本没有任何校验代码可供描述。
+1) 授予 reader 权限 documents:read：
 
-3. 查询是否会改变已有配置：【不适用】不存在查询函数，也不存在配置
-   存储，因此没有可观察的读写行为。无法陈述"查询是只读的"这类结论。
+    python -m rbac --db rules.db grant reader documents:read
 
-4. 已存在错误的异常类型与触发条件：【无】仓库中没有任何 raise 语句、
-   自定义异常类或错误处理代码（没有任何 .py 文件）。当前版本不存在
-   可列出的异常类型。
+   预期：退出码 0；标准错误为空；标准输出恰为单个 JSON 对象加一个换行：
 
-5. 不属于入口输入的名称边界：【不适用】既然入口本身不存在，"哪些
-   名称不属于入口输入"无从界定，此处明确标记为不适用，不增设任何
-   校验要求。
+    {"role":"reader","permission":"documents:read"}
 
-6. SQLite 相关：
-   - 表结构：【未实现】仓库中没有建表语句、迁移脚本或任何 .sql /
-     .py 文件；.gitignore 中的 *.sqlite / *.sqlite3 / *.sqlite-*
-     规则只是对将来数据库文件的忽略约定，不代表已有数据库。
-   - 读写代码：【未实现】不存在任何连接、查询或写入 SQLite 的代码。
-   - "判定依赖哪些已保存的数据"：当前无已保存数据可言，判定本身
-     亦不存在。
-   - "重新打开已有数据库是否影响这些事实"：【不适用】没有数据库
-     文件、没有打开数据库的代码，该问题在当前版本没有可核对的
-     对象。
+   副作用：创建 rules.db 文件与 role_permissions 表，并写入一条
+   (reader, documents:read) 记录。
+
+2) 随后查询 alice 是否拥有 documents:read：
+
+    python -m rbac --db rules.db check alice documents:read
+
+   预期：退出码 0；标准错误为空；标准输出恰为单个 JSON 对象加一个换行：
+
+    {"member":"alice","permission":"documents:read","roles":["reader"],"allowed":true,"reason":"直接角色授权"}
+
+   即允许 alice，其角色为 reader，原因是直接角色授权。
+
+3) 同库查询未授予的权限 documents:write：
+
+    python -m rbac --db rules.db check alice documents:write
+
+   预期输出（退出码 0，标准错误为空）：
+
+    {"member":"alice","permission":"documents:write","roles":["reader"],"allowed":false,"reason":"权限未授予"}
+
+   alice 有角色 reader，但规则库中没有 (reader, documents:write)，
+   故 allowed 为 false，原因为权限未授予。
+
+4) 同库查询未配置成员 bob：
+
+    python -m rbac --db rules.db check bob documents:read
+
+   预期输出（退出码 0，标准错误为空）：
+
+    {"member":"bob","permission":"documents:read","roles":[],"allowed":false,"reason":"成员未配置"}
+
+   bob 不在固定配置中，角色列表为空，allowed 为 false，原因为成员未配置。
+
+5) 持久化与幂等：
+   - 每次调用都重新打开同一数据库文件；重新打开 rules.db 后再次执行
+     第 2 步的 check，输出与之前完全一致，授权记录仍然保留。
+   - 重复执行第 1 步的 grant，因 INSERT OR IGNORE 与 (role, permission)
+     主键约束，role_permissions 表中仍只有一条 (reader, documents:read)
+     记录，不增加规则记录。
 
 
-五、验收指引
+三、名称与存储边界（逐条可核对）
+--------------------------------
+1. 名称规整与大小写
+   名称先去除首尾空白，再按完整字符串大小写敏感匹配。例如带首尾空白
+   的 "  reader\t" 规整为 "reader" 后参与授权与查询；而 "Alice" 不会
+   命中固定成员 "alice"（按未配置成员处理），"documents:Read" 不会
+   命中已授予的 "documents:read"（按权限未授予处理）。
+   核对位置：rbac/policy.py normalize_name()；tests 中
+   test_surrounding_whitespace_is_trimmed、test_name_matching_is_case_sensitive。
+
+2. 空名称 / 纯空白名称
+   任一名称去除首尾空白后为空（空字符串或纯空白）时：
+   - 退出码 2；
+   - 标准输出为空；
+   - 标准错误恰为一行 {"error":"invalid_name"} 加一个换行；
+   - 不打开、不创建数据库文件，也不改动任何已有授权。
+   核对位置：rbac/__main__.py main() 中 normalized 校验段（注释明确
+   "不打开存储、不改动任何已有授权"）；tests 中
+   test_empty_or_blank_names_are_invalid_and_create_no_database、
+   test_invalid_name_does_not_change_existing_grants。
+
+3. 数据库父目录不存在
+   名称有效但 --db 路径的父目录不存在（sqlite3 无法创建文件）时：
+   - 退出码 1；
+   - 标准输出为空；
+   - 标准错误恰为一行 {"error":"storage_error"} 加一个换行。
+   核对位置：rbac/store.py connect() 将 sqlite3.Error 包装为
+   StorageError；rbac/__main__.py main() 的 except 分支；tests 中
+   test_missing_parent_directory_is_storage_error。
+
+4. 名称与路径同时无效
+   名称为空且数据库父目录也不存在时，优先报名称错误：退出码 2，
+   标准错误为 {"error":"invalid_name"}，因为名称校验发生在打开
+   数据库之前。
+   核对位置：rbac/__main__.py main() 中名称校验先于 store.connect()
+   的执行顺序；tests 中 test_invalid_name_takes_precedence_over_storage_error。
+
+5. 固定成员关系与数据边界
+   - alice 与 reader 的对应关系来自 rbac/policy.py 中的固定配置
+     FIXED_MEMBER_ROLES，不来自数据库；数据库只保存"角色 -> 权限"
+     规则（rbac/store.py 模块 docstring 明确说明成员-角色对应不入库）。
+   - grant 只写入角色-权限规则，不改变任何成员的角色配置。
+   - check 是只读判定，不改变已有授权记录（tests 中
+     test_check_is_read_only 核对查询前后授权记录一致）；但 check 同样
+     会经 store.connect() 打开规则库，因此在数据库文件尚不存在时，
+     一次 check 也可能创建该文件并建立表结构。
+   - 不存在登录、角色继承或成员管理功能（rbac/policy.py 注释），本文
+     不将这些长期规划方向描述为已实现能力。
+
+
+四、验收指引
 ------------
-1. 核对本文每条结论的方法：
-   - 在仓库根目录执行 `git ls-files`，确认受控文件仅 .gitignore 与
-     README.md；
-   - 阅读 README.md 全文（6 行），确认第 5 行声明业务功能尚未实现；
-   - 执行 `git log --all --oneline`，确认仓库仅有提交 e634a58，
-     不存在含源码的其他分支或历史。
-2. 复现示例：当前版本无法复现。任何 alice / reader / documents:read
-   的允许或拒绝结果都没有公开入口可以产生；本文第三节已逐项列出
-   缺失的前置步骤及其影响。待业务功能实现后，本文第二、三、四节中
-   所有【未实现】/【不适用】标记应被替换为对实际源码的引用与描述。
-3. 本文未修改、新增或删除任何源码、数据或公开接口；本文件（纯文本
-   说明）是本次交付的唯一新增内容。
+1. 本文每条结论均可对照当前源码核对：流程各环节见第一节标注的文件与
+   函数；对外行为（退出码、标准输出/标准错误内容）见第二、三节示例。
+2. 在项目根目录执行 `python -m unittest discover -s tests`，当前
+   11 个用例全部通过，逐一覆盖本文描述的允许/拒绝分支、名称边界、
+   存储失败、持久化与幂等。
+3. 按第二节命令手工执行，可复现与文中完全一致的 JSON 输出与退出码。
+4. 本次交付仅更新本文件（docs/直接角色规则判定流程说明.txt），未修改、
+   新增或删除任何业务代码、测试、README 或数据格式。
 
 交付位置：docs/直接角色规则判定流程说明.txt（相对于仓库根目录）。
