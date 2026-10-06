@@ -82,6 +82,23 @@ def permission_granted(conn, roles, permission):
     return row is not None
 
 
+def list_permissions_for_roles(conn, roles):
+    """列出多个角色已获授权限的去重合集；本函数只执行只读查询。
+
+    权限按保存名称原样返回，去重后按完整字符串的 Unicode 码点顺序升序排列；
+    角色列表为空或这些角色均无任何授权时返回空列表。
+    """
+    if not roles:
+        return []
+    placeholders = ",".join("?" for _ in roles)
+    sql = "SELECT permission FROM role_permissions WHERE role IN (%s)" % placeholders
+    try:
+        rows = conn.execute(sql, list(roles)).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({row[0] for row in rows})
+
+
 def list_permissions(conn, role):
     """列出角色直接获授的全部权限；本函数只执行只读查询。
 
