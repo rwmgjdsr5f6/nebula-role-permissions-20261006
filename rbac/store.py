@@ -116,6 +116,23 @@ def list_roles_for_permission(conn, permission):
     return sorted({row[0] for row in rows})
 
 
+def list_all_rules(conn):
+    """导出库中现存的全部直接角色授权规则；本函数只执行只读查询。
+
+    同一（角色, 权限）组合只出现一次；先按完整角色名的 Unicode 码点
+    顺序升序排列，角色相同时再按完整权限名同样排序。名称按保存值
+    原样返回，保留大小写，不再裁剪；"*"、"%"、"_" 均为普通字符。
+    返回 (role, permission) 元组列表；空库返回空列表。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT role, permission FROM role_permissions"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({(row[0], row[1]) for row in rows})
+
+
 def list_permissions_for_roles(conn, roles):
     """汇总多个角色当前已获授权限的去重合集；本函数只执行只读查询。
 

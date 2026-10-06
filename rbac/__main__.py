@@ -6,6 +6,7 @@
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-member-permissions MEMBER
+    python -m rbac --db FILE export-rules
 
 退出码约定：
 - 0：成功，标准输出为一个 JSON 对象；
@@ -68,6 +69,10 @@ def _build_parser():
         "list-permission-roles", help="列出直接获授某权限的全部角色"
     )
     permission_roles_parser.add_argument("permission")
+
+    subparsers.add_parser(
+        "export-rules", help="导出库中现存的全部直接角色授权规则"
+    )
     return parser
 
 
@@ -80,7 +85,10 @@ def main(argv=None):
 
     args = _build_parser().parse_args(argv)
 
-    if args.command in ("grant", "revoke"):
+    if args.command == "export-rules":
+        # 不接收成员、角色或权限参数，无需名称校验。
+        raw_names = ()
+    elif args.command in ("grant", "revoke"):
         raw_names = (args.role, args.permission)
     elif args.command == "list-permissions":
         raw_names = (args.role,)
@@ -96,7 +104,7 @@ def main(argv=None):
         # 不打开存储、不改动任何已有授权。
         _fail("invalid_name")
         return 2
-    target_name = normalized[0]
+    target_name = normalized[0] if normalized else None
     permission = normalized[1] if len(normalized) > 1 else None
 
     try:
@@ -107,7 +115,15 @@ def main(argv=None):
 
     try:
         try:
-            if args.command == "grant":
+            if args.command == "export-rules":
+                rules = store.list_all_rules(conn)
+                result = {
+                    "rules": [
+                        {"role": role, "permission": permission}
+                        for role, permission in rules
+                    ]
+                }
+            elif args.command == "grant":
                 store.grant_permission(conn, target_name, permission)
                 result = {"role": target_name, "permission": permission}
             elif args.command == "revoke":
