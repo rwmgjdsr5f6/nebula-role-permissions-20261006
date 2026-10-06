@@ -7,6 +7,8 @@
 
 覆盖范围：
 - 空规则库查询、授权后允许、重新打开持久化、重复授予幂等；
+- 撤销已有授权返回 revoked=true、撤销后查询拒绝且持久化、重复撤销
+  与不存在规则返回 revoked=false、撤销不影响其他授权、撤销后可重新授予；
 - 未授予权限与未配置成员的拒绝原因；
 - 成功调用的退出码 0、标准输出单个 JSON 对象加换行、标准错误为空；
 - 查询前后授权记录一致（查询只读）；
@@ -71,6 +73,9 @@ class DirectRoleFlowTests(unittest.TestCase):
 
     def grant(self, role, permission, **kwargs):
         return self.run_rbac("grant", role, permission, **kwargs)
+
+    def revoke(self, role, permission, **kwargs):
+        return self.run_rbac("revoke", role, permission, **kwargs)
 
     def check(self, member, permission, **kwargs):
         return self.run_rbac("check", member, permission, **kwargs)
@@ -288,6 +293,230 @@ class DirectRoleFlowTests(unittest.TestCase):
             rules_after,
             f"查询前后授权记录应一致，查询前 {rules_before!r}，查询后 {rules_after!r}",
         )
+
+    # ---- 撤销授权 -------------------------------------------------------
+
+    def test_revoke_existing_grant_denies_and_persists(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置授权 reader/documents:read"
+        )
+
+        revoke_result = self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "撤销 reader/documents:read"
+        )
+        self.assertEqual(
+            revoke_result,
+            {"role": "reader", "permission": PERMISSION_READ, "revoked": True},
+            f"撤销已有规则应返回 revoked=true，实际为 {revoke_result!r}",
+        )
+        self.assertEqual(
+            self.stored_rules(),
+            [],
+            f"撤销后授权记录应为空，实际为 {self.stored_rules()!r}",
+        )
+
+        # 撤销后 alice 仍固定拥有 reader 角色，但该权限不再授予。
+        check_result = self.assert_success_json(
+            self.check("alice", PERMISSION_READ), "撤销后查询 alice/documents:read"
+        )
+        self.assertEqual(
+            check_result,
+            {
+                "member": "alice",
+                "permission": PERMISSION_READ,
+                "roles": ["reader"],
+                "allowed": False,
+                "reason": "权限未授予",
+            },
+            f"撤销后查询结果与预期不符，实际为 {check_result!r}",
+        )
+
+        # 重新打开同一数据库文件：撤销结果必须持久化。
+        reopened_result = self.assert_success_json(
+            self.check("alice", PERMISSION_READ), "重新打开数据库后再次查询"
+        )
+        self.assertEqual(
+            reopened_result,
+            check_result,
+            f"重新打开数据库后结果发生变化，实际为 {reopened_result!r}",
+        )
+
+        # 再次授予同一规则后恢复允许。
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "撤销后重新授予"
+        )
+        regranted_result = self.assert_success_json(
+            self.check("alice", PERMISSION_READ), "重新授予后查询"
+        )
+        self.assertEqual(
+            regranted_result["allowed"],
+            True,
+            f"重新授予后应恢复允许，实际为 {regranted_result!r}",
+        )
+
+    def test_revoke_missing_rule_returns_false(self):
+        # 数据库文件尚不存在：沿用建库行为，按未删除处理。
+        revoke_result = self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "撤销不存在的规则（新建库）"
+        )
+        self.assertEqual(
+            revoke_result,
+            {"role": "reader", "permission": PERMISSION_READ, "revoked": False},
+            f"规则不存在时应返回 revoked=false，实际为 {revoke_result!r}",
+        )
+        self.assertTrue(
+            os.path.exists(self.db_path),
+            "父目录存在时撤销应沿用建库行为创建数据库文件",
+        )
+
+        # 没有对应授权的非空角色名称同样按未删除处理，不另报角色不存在。
+        unknown_role_result = self.assert_success_json(
+            self.revoke("nobody", PERMISSION_READ), "撤销从未授权的角色"
+        )
+        self.assertEqual(
+            unknown_role_result,
+            {"role": "nobody", "permission": PERMISSION_READ, "revoked": False},
+            f"未知角色应返回 revoked=false，实际为 {unknown_role_result!r}",
+        )
+
+        # 重复撤销同一规则：第一次 true，第二次 false，均成功。
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader/documents:read"
+        )
+        first = self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "第一次撤销"
+        )
+        second = self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "重复撤销"
+        )
+        self.assertTrue(first["revoked"], f"第一次撤销应为 true，实际为 {first!r}")
+        self.assertFalse(
+            second["revoked"], f"重复撤销应为 false，实际为 {second!r}"
+        )
+
+    def test_revoke_does_not_touch_other_grants(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader/documents:read"
+        )
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_WRITE), "授予 reader/documents:write"
+        )
+        self.assert_success_json(
+            self.grant("editor", PERMISSION_READ), "授予 editor/documents:read"
+        )
+
+        self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "撤销 reader/documents:read"
+        )
+
+        rules = self.stored_rules()
+        self.assertEqual(
+            rules,
+            [("editor", PERMISSION_READ), ("reader", PERMISSION_WRITE)],
+            f"撤销不应影响其他角色或权限的授权，实际记录为 {rules!r}",
+        )
+
+        # alice 与 reader 的固定关系不变：其他权限仍允许。
+        write_result = self.assert_success_json(
+            self.check("alice", PERMISSION_WRITE), "撤销后查询 documents:write"
+        )
+        self.assertEqual(
+            write_result,
+            {
+                "member": "alice",
+                "permission": PERMISSION_WRITE,
+                "roles": ["reader"],
+                "allowed": True,
+                "reason": "直接角色授权",
+            },
+            f"未被撤销的权限应继续允许，实际为 {write_result!r}",
+        )
+
+    def test_revoke_trims_whitespace_and_matches_exactly(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader/documents:read"
+        )
+
+        # 带首尾空白的名称规整后命中同一规则。
+        revoke_result = self.assert_success_json(
+            self.revoke("  reader\t", f"\n{PERMISSION_READ} "), "带首尾空白的 revoke"
+        )
+        self.assertEqual(
+            revoke_result,
+            {"role": "reader", "permission": PERMISSION_READ, "revoked": True},
+            f"revoke 应返回规整后的名称，实际为 {revoke_result!r}",
+        )
+
+        # 大小写不同或通配符形态的名称不命中已有规则。
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "重新授予 reader/documents:read"
+        )
+        for role, permission in (
+            ("Reader", PERMISSION_READ),
+            ("reader", "documents:Read"),
+            ("reader", "documents:*"),
+            ("reader", "documents:%"),
+        ):
+            with self.subTest(role=role, permission=permission):
+                result = self.assert_success_json(
+                    self.revoke(role, permission), f"撤销 {role}/{permission}"
+                )
+                self.assertFalse(
+                    result["revoked"],
+                    f"{role}/{permission} 不应命中 documents:read，实际为 {result!r}",
+                )
+        self.assertEqual(
+            self.stored_rules(),
+            [("reader", PERMISSION_READ)],
+            f"精确匹配之外的撤销不应删除已有规则，实际为 {self.stored_rules()!r}",
+        )
+
+    def test_revoke_empty_or_blank_names_are_invalid(self):
+        cases = [
+            ("", PERMISSION_READ),
+            ("reader", ""),
+            ("   ", PERMISSION_READ),
+            ("reader", "\t \n"),
+            ("", ""),
+        ]
+        for index, (role, permission) in enumerate(cases):
+            with self.subTest(role=role, permission=permission):
+                fresh_db = os.path.join(self.tmpdir, f"revoke_invalid_{index}.db")
+                argv = ("revoke", role, permission)
+                proc = self.run_rbac(*argv, db=fresh_db)
+                self.assert_invalid_name(proc, argv, fresh_db_path=fresh_db)
+
+    def test_revoke_invalid_name_does_not_change_existing_grants(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置一条授权"
+        )
+        rules_before = self.stored_rules()
+
+        for argv in (
+            ("revoke", "", PERMISSION_READ),
+            ("revoke", "reader", "   "),
+        ):
+            with self.subTest(argv=argv):
+                self.assert_invalid_name(self.run_rbac(*argv), argv)
+
+        self.assertEqual(
+            rules_before,
+            self.stored_rules(),
+            f"非法名称的撤销不应改变已有授权，之前 {rules_before!r}，"
+            f"之后 {self.stored_rules()!r}",
+        )
+
+    def test_revoke_missing_parent_directory_is_storage_error(self):
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        argv = ("revoke", "reader", PERMISSION_READ)
+        proc = self.run_rbac(*argv, db=missing_parent_db)
+        self.assert_storage_error(proc, argv)
+
+    def test_revoke_invalid_name_takes_precedence_over_storage_error(self):
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        argv = ("revoke", " ", "")
+        proc = self.run_rbac(*argv, db=missing_parent_db)
+        self.assert_invalid_name(proc, argv, fresh_db_path=missing_parent_db)
 
     # ---- 名称边界 -------------------------------------------------------
 
