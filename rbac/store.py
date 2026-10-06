@@ -80,3 +80,19 @@ def permission_granted(conn, roles, permission):
     except sqlite3.Error as exc:
         raise StorageError(str(exc)) from exc
     return row is not None
+
+
+def list_permissions(conn, role):
+    """列出角色直接获授的全部权限；本函数只执行只读查询。
+
+    权限按保存名称原样返回，去重后按完整字符串的 Unicode 码点顺序升序排列；
+    角色没有任何授权（含角色从未出现）时返回空列表。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT permission FROM role_permissions WHERE role = ?",
+            (role,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({row[0] for row in rows})

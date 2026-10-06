@@ -10,6 +10,8 @@
 - 撤销已有授权返回 revoked=true、撤销后查询拒绝且持久化、重复撤销
   与不存在规则返回 revoked=false、撤销不影响其他授权、撤销后可重新授予；
 - 未授予权限与未配置成员的拒绝原因；
+- list-permissions 按角色列出直接授权：建库初始化、排序去重、撤销后更新、
+  角色隔离与大小写敏感、无成员角色、码点排序、只读性；
 - 成功调用的退出码 0、标准输出单个 JSON 对象加换行、标准错误为空；
 - 查询前后授权记录一致（查询只读）；
 - 名称首尾空白规整、大小写敏感的完整字符串匹配；
@@ -79,6 +81,9 @@ class DirectRoleFlowTests(unittest.TestCase):
 
     def check(self, member, permission, **kwargs):
         return self.run_rbac("check", member, permission, **kwargs)
+
+    def list_permissions(self, role, **kwargs):
+        return self.run_rbac("list-permissions", role, **kwargs)
 
     def parse_single_json_line(self, stdout, context):
         """标准输出必须恰好是一个 JSON 对象加一个换行；返回解析后的对象。"""
@@ -517,6 +522,181 @@ class DirectRoleFlowTests(unittest.TestCase):
         argv = ("revoke", " ", "")
         proc = self.run_rbac(*argv, db=missing_parent_db)
         self.assert_invalid_name(proc, argv, fresh_db_path=missing_parent_db)
+
+    # ---- 列出角色权限 ---------------------------------------------------
+
+    def test_list_permissions_on_missing_db_initializes_and_returns_empty(self):
+        # 数据库文件尚不存在但父目录存在：沿用 check 的建库行为。
+        self.assertFalse(os.path.exists(self.db_path), "测试前置：数据库应尚未创建")
+        result = self.assert_success_json(
+            self.list_permissions("reader"), "新规则库列出 reader 的权限"
+        )
+        self.assertEqual(
+            result,
+            {"role": "reader", "permissions": []},
+            f"空规则库应返回空权限数组，实际为 {result!r}",
+        )
+        self.assertTrue(
+            os.path.exists(self.db_path),
+            "父目录存在时查询应沿用建库行为创建数据库文件",
+        )
+
+    def test_list_permissions_after_grant_matches_acceptance_sample(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader/documents:read"
+        )
+        result = self.assert_success_json(
+            self.list_permissions("reader"), "列出 reader 的权限"
+        )
+        self.assertEqual(
+            result,
+            {"role": "reader", "permissions": [PERMISSION_READ]},
+            f"查询结果与验收样例不符，实际为 {result!r}",
+        )
+        self.assertEqual(
+            set(result.keys()),
+            {"role", "permissions"},
+            f"输出对象应只包含 role 和 permissions，实际键为 {set(result.keys())}",
+        )
+
+    def test_list_permissions_sorted_deduped_and_reflects_revoke(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_WRITE), "预置 reader/documents:write"
+        )
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置 reader/documents:read"
+        )
+        # 重复授予不应在数组中产生重复项。
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "重复授予 reader/documents:read"
+        )
+
+        result = self.assert_success_json(
+            self.list_permissions("reader"), "列出 reader 的两项权限"
+        )
+        self.assertEqual(
+            result["permissions"],
+            [PERMISSION_READ, PERMISSION_WRITE],
+            f"权限应按码点升序且不重复，实际为 {result['permissions']!r}",
+        )
+
+        self.assert_success_json(
+            self.revoke("reader", PERMISSION_READ), "撤销 reader/documents:read"
+        )
+        revoked_result = self.assert_success_json(
+            self.list_permissions("reader"), "撤销后重新列出 reader 的权限"
+        )
+        self.assertEqual(
+            revoked_result["permissions"],
+            [PERMISSION_WRITE],
+            f"撤销后不应再包含 documents:read，实际为 {revoked_result['permissions']!r}",
+        )
+
+    def test_list_permissions_scopes_to_role_and_needs_no_members(self):
+        # 未关联任何成员的角色同样可以列出其直接授权。
+        self.assert_success_json(
+            self.grant("ghost", "ghost:only"), "授予未关联成员的角色 ghost"
+        )
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader/documents:read"
+        )
+        self.assert_success_json(
+            self.grant("editor", PERMISSION_WRITE), "授予 editor/documents:write"
+        )
+
+        ghost_result = self.assert_success_json(
+            self.list_permissions("ghost"), "列出无成员角色 ghost"
+        )
+        self.assertEqual(
+            ghost_result,
+            {"role": "ghost", "permissions": ["ghost:only"]},
+            f"ghost 应只含自身授权，实际为 {ghost_result!r}",
+        )
+
+        reader_result = self.assert_success_json(
+            self.list_permissions("reader"), "列出 reader"
+        )
+        self.assertEqual(
+            reader_result["permissions"],
+            [PERMISSION_READ],
+            f"reader 不应包含其他角色的权限，实际为 {reader_result['permissions']!r}",
+        )
+
+        # 从未授权的角色不报错，返回空数组。
+        nobody_result = self.assert_success_json(
+            self.list_permissions("nobody"), "列出从未授权的角色"
+        )
+        self.assertEqual(
+            nobody_result,
+            {"role": "nobody", "permissions": []},
+            f"未知角色应返回空数组，实际为 {nobody_result!r}",
+        )
+
+        # 大小写敏感：Reader 与 reader 分别查询。
+        cas_result = self.assert_success_json(
+            self.list_permissions("Reader"), "列出大小写不同的 Reader"
+        )
+        self.assertEqual(
+            cas_result,
+            {"role": "Reader", "permissions": []},
+            f"Reader 不应命中 reader 的授权，实际为 {cas_result!r}",
+        )
+
+    def test_list_permissions_trims_whitespace_and_sorts_by_codepoint(self):
+        for permission in ("中", "A", "b", "a", "abc"):
+            self.assert_success_json(
+                self.grant("r", permission), f"预置权限 {permission}"
+            )
+        result = self.assert_success_json(
+            self.list_permissions("  r\t"), "带首尾空白的角色名查询"
+        )
+        # 返回规整后的角色名；权限按 Unicode 码点顺序升序（A<a<abc<b<中）。
+        self.assertEqual(
+            result,
+            {"role": "r", "permissions": ["A", "a", "abc", "b", "中"]},
+            f"码点排序与名称规整不符合预期，实际为 {result!r}",
+        )
+
+    def test_list_permissions_is_read_only(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置 reader/documents:read"
+        )
+        self.assert_success_json(
+            self.grant("editor", PERMISSION_WRITE), "预置 editor/documents:write"
+        )
+        rules_before = self.stored_rules()
+
+        for role in ("reader", "editor", "ghost", "Reader"):
+            self.assert_success_json(
+                self.list_permissions(role), f"只读性核对，列出 {role}"
+            )
+
+        self.assertEqual(
+            rules_before,
+            self.stored_rules(),
+            f"列出权限不应改动授权记录，之前 {rules_before!r}，"
+            f"之后 {self.stored_rules()!r}",
+        )
+
+    def test_list_permissions_empty_or_blank_role_is_invalid(self):
+        for index, role in enumerate(("", "   ", "\t \n")):
+            with self.subTest(role=role):
+                fresh_db = os.path.join(self.tmpdir, f"list_invalid_{index}.db")
+                argv = ("list-permissions", role)
+                proc = self.run_rbac(*argv, db=fresh_db)
+                self.assert_invalid_name(proc, argv, fresh_db_path=fresh_db)
+
+    def test_list_permissions_invalid_name_takes_precedence_over_storage_error(self):
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        argv = ("list-permissions", " ")
+        proc = self.run_rbac(*argv, db=missing_parent_db)
+        self.assert_invalid_name(proc, argv, fresh_db_path=missing_parent_db)
+
+    def test_list_permissions_missing_parent_directory_is_storage_error(self):
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        argv = ("list-permissions", "reader")
+        proc = self.run_rbac(*argv, db=missing_parent_db)
+        self.assert_storage_error(proc, argv)
 
     # ---- 名称边界 -------------------------------------------------------
 
