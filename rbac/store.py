@@ -131,3 +131,25 @@ def list_permissions_for_roles(conn, roles):
     except sqlite3.Error as exc:
         raise StorageError(str(exc)) from exc
     return sorted({row[0] for row in rows})
+
+
+def export_rules(conn):
+    """导出库中现存的全部直接角色授权；本函数只执行只读查询。
+
+    返回 {"role": 角色名, "permission": 权限名} 列表：名称沿用保存值，
+    保留大小写，"*"、"%"、"_" 均为普通字符原样输出；同一（角色, 权限）
+    组合只出现一次。数组先按完整角色名、角色相同时再按完整权限名的
+    Unicode 码点顺序升序排列，因此规则不变时重复导出结果与顺序一致。
+    未分配给成员的角色同样导出；空库返回空列表。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT role, permission FROM role_permissions"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    # 主键已保证组合唯一，再去重一次以容忍任何来源的重复行。
+    return [
+        {"role": role, "permission": permission}
+        for role, permission in sorted(set(rows))
+    ]
