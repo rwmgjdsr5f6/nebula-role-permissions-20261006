@@ -66,6 +66,21 @@ def revoke_permission(conn, role, permission):
     return cursor.rowcount > 0
 
 
+def list_permissions(conn, role):
+    """列出角色当前直接获授的全部权限，按 Unicode 码点升序、不重复。
+
+    只读查询；角色没有任何授权时返回空列表，不区分“角色不存在”。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT permission FROM role_permissions WHERE role = ?",
+            (role,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({row[0] for row in rows})
+
+
 def permission_granted(conn, roles, permission):
     """任一直接角色拥有该权限即为 True；本函数只执行只读查询。"""
     if not roles:

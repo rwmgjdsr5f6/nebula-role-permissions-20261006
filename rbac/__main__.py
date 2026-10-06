@@ -3,6 +3,7 @@
     python -m rbac --db FILE grant ROLE PERMISSION
     python -m rbac --db FILE revoke ROLE PERMISSION
     python -m rbac --db FILE check MEMBER PERMISSION
+    python -m rbac --db FILE list-permissions ROLE
 
 退出码约定：
 - 0：成功，标准输出为一个 JSON 对象；
@@ -50,6 +51,11 @@ def _build_parser():
     check_parser = subparsers.add_parser("check", help="查询成员是否拥有某权限")
     check_parser.add_argument("member")
     check_parser.add_argument("permission")
+
+    list_parser = subparsers.add_parser(
+        "list-permissions", help="列出角色直接获授的全部权限"
+    )
+    list_parser.add_argument("role")
     return parser
 
 
@@ -64,15 +70,16 @@ def main(argv=None):
 
     if args.command in ("grant", "revoke"):
         raw_names = (args.role, args.permission)
-    else:
+    elif args.command == "check":
         raw_names = (args.member, args.permission)
+    else:
+        raw_names = (args.role,)
 
     normalized = [policy.normalize_name(name) for name in raw_names]
     if any(name is None for name in normalized):
         # 不打开存储、不改动任何已有授权。
         _fail("invalid_name")
         return 2
-    target_name, permission = normalized
 
     try:
         conn = store.connect(args.db)
@@ -83,20 +90,29 @@ def main(argv=None):
     try:
         try:
             if args.command == "grant":
+                target_name, permission = normalized
                 store.grant_permission(conn, target_name, permission)
                 result = {"role": target_name, "permission": permission}
             elif args.command == "revoke":
+                target_name, permission = normalized
                 revoked = store.revoke_permission(conn, target_name, permission)
                 result = {
                     "role": target_name,
                     "permission": permission,
                     "revoked": revoked,
                 }
-            else:
+            elif args.command == "check":
+                target_name, permission = normalized
                 granted = store.permission_granted(
                     conn, policy.roles_for(target_name), permission
                 )
                 result = policy.decide(target_name, permission, granted)
+            else:
+                (target_name,) = normalized
+                result = {
+                    "role": target_name,
+                    "permissions": store.list_permissions(conn, target_name),
+                }
         except store.StorageError:
             _fail("storage_error")
             return 1
