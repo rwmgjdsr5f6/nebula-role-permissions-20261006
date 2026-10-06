@@ -1,6 +1,7 @@
 """命令行入口：
 
     python -m rbac --db FILE grant ROLE PERMISSION
+    python -m rbac --db FILE revoke ROLE PERMISSION
     python -m rbac --db FILE check MEMBER PERMISSION
 
 退出码约定：
@@ -42,6 +43,10 @@ def _build_parser():
     grant_parser.add_argument("role")
     grant_parser.add_argument("permission")
 
+    revoke_parser = subparsers.add_parser("revoke", help="撤销角色某个权限")
+    revoke_parser.add_argument("role")
+    revoke_parser.add_argument("permission")
+
     check_parser = subparsers.add_parser("check", help="查询成员是否拥有某权限")
     check_parser.add_argument("member")
     check_parser.add_argument("permission")
@@ -57,7 +62,7 @@ def main(argv=None):
 
     args = _build_parser().parse_args(argv)
 
-    if args.command == "grant":
+    if args.command in ("grant", "revoke"):
         raw_names = (args.role, args.permission)
     else:
         raw_names = (args.member, args.permission)
@@ -80,6 +85,13 @@ def main(argv=None):
             if args.command == "grant":
                 store.grant_permission(conn, target_name, permission)
                 result = {"role": target_name, "permission": permission}
+            elif args.command == "revoke":
+                revoked = store.revoke_permission(conn, target_name, permission)
+                result = {
+                    "role": target_name,
+                    "permission": permission,
+                    "revoked": revoked,
+                }
             else:
                 granted = store.permission_granted(
                     conn, policy.roles_for(target_name), permission

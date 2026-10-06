@@ -49,6 +49,19 @@ def grant_permission(conn, role, permission):
         raise StorageError(str(exc)) from exc
 
 
+def revoke_permission(conn, role, permission):
+    """撤销角色的某个权限；返回是否实际删除了已有规则。"""
+    try:
+        cursor = conn.execute(
+            "DELETE FROM role_permissions WHERE role = ? AND permission = ?",
+            (role, permission),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return cursor.rowcount > 0
+
+
 def permission_granted(conn, roles, permission):
     """任一直接角色拥有该权限即为 True；本函数只执行只读查询。"""
     if not roles:
