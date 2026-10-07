@@ -71,6 +71,7 @@ python -m rbac --db FILE list-permissions ROLE
 python -m rbac --db FILE list-permission-roles PERMISSION
 python -m rbac --db FILE list-permission-members PERMISSION
 python -m rbac --db FILE list-member-permissions MEMBER
+python -m rbac --db FILE list-role-members ROLE
 python -m rbac --db FILE list-roles
 python -m rbac --db FILE list-all-permissions
 python -m rbac --db FILE export-rules

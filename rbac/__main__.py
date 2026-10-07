@@ -7,6 +7,7 @@
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-permission-members PERMISSION
     python -m rbac --db FILE list-member-permissions MEMBER
+    python -m rbac --db FILE list-role-members ROLE
     python -m rbac --db FILE list-roles
     python -m rbac --db FILE list-all-permissions
     python -m rbac --db FILE export-rules
@@ -79,6 +80,11 @@ def _build_parser():
     )
     permission_members_parser.add_argument("permission")
 
+    role_members_parser = subparsers.add_parser(
+        "list-role-members", help="按固定成员关系列出角色对应的合成成员"
+    )
+    role_members_parser.add_argument("role")
+
     subparsers.add_parser(
         "list-roles", help="列出当前至少持有一条直接授权的全部角色"
     )
@@ -114,6 +120,8 @@ def main(argv=None):
         raw_names = (args.permission,)
     elif args.command == "list-member-permissions":
         raw_names = (args.member,)
+    elif args.command == "list-role-members":
+        raw_names = (args.role,)
     else:
         raw_names = (args.member, args.permission)
 
@@ -174,6 +182,12 @@ def main(argv=None):
                     "member": target_name,
                     "roles": roles,
                     "permissions": permissions,
+                }
+            elif args.command == "list-role-members":
+                # 结果只取决于固定成员关系；连接仅沿用既有初始化行为。
+                result = {
+                    "role": target_name,
+                    "members": policy.members_for_role(target_name),
                 }
             else:
                 granted = store.permission_granted(

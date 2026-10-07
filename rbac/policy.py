@@ -50,6 +50,19 @@ def members_for_permission(granted_roles):
     ]
 
 
+def members_for_role(role):
+    """返回固定成员关系中绑定指定角色的全部成员名；纯内存计算，不访问存储。
+
+    角色按完整名称大小写敏感精确匹配（"*"、"%"、"_" 均为普通字符）。
+    成员名按配置中的保存值原样返回，去重后按完整名称的 Unicode 码点
+    顺序升序排列；角色未关联任何成员（含角色从未出现）时返回空列表。
+    结果只取决于 FIXED_MEMBER_ROLES，与当前授权无关。
+    """
+    return sorted(
+        {member for member, roles in FIXED_MEMBER_ROLES.items() if role in roles}
+    )
+
+
 def decide(member, permission, granted):
     """依据成员角色与规则匹配结果生成决定。
 
