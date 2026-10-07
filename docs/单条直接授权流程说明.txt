@@ -1,0 +1,404 @@
+本地角色权限规则库 —— 单条直接授权流程说明（grant）
+====================================================
+
+文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态：
+名称规整、规则库准备、重复规则判断、新增规则保存及结果输出五个环节，
+并解释“授权成功”的确切含义与两类失败的边界。文中结论逐一标注对应源
+文件与函数，可对照源码与 tests/ 下现有回归测试核对。第五节验收示例中
+标注“实际观察”的部分，是编写本文时在临时目录中真实执行过的记录
+（执行环境的 PATH 上只有 python3、没有 python，故实跑以等价的
+python3 -m rbac 完成；文档中的命令仍按公开形态写作 python -m rbac）；
+其余未执行的输入输出均标为“预期”，是按当前源码推导出的唯一结果。
+本次交付仅新增本文件，不修改任何业务代码、测试、README、其他入口
+（revoke、check、list-*、export-rules 等）的现有行为，也不改变 SQLite
+数据库格式与全部公开命令的既有行为。本文不描述成员管理、角色继承、
+通配权限等源码中不存在的能力。
+
+
+核对基准
+--------
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverA/task034
+  （即包含 rbac/ 包、docs/ 与 tests/ 的目录。）
+- 本流程直接依据的源码文件与函数：
+    rbac/__main__.py  —— main()、_build_parser()、_emit()、_fail()、
+                         _SEPARATORS
+    rbac/policy.py    —— normalize_name()、FIXED_MEMBER_ROLES
+    rbac/store.py     —— connect()、grant_permission()、StorageError、
+                         _SCHEMA
+- 可对照的现有测试：
+    tests/test_grant_constraint.py
+      （既有表带 role 单列 UNIQUE 或 permission 列 CHECK 约束时，
+      新增规则被拒绝按存储失败处理；重复授权幂等成功；标准复合主键库
+      允许同一角色持有读、写两项权限）
+    tests/test_grant_permission_store.py
+      （存储层 grant_permission 返回值含义、约束拒绝抛 StorageError、
+      失败后授权行与其他表结构不变、失败后同一连接仍可合法授权）
+    tests/test_non_sqlite_rulefile.py
+      （非 SQLite 文件上 grant 的存储失败；空白名称优先于存储失败）
+    tests/test_direct_role_flow.py
+      （grant 后 check 允许且持久化、重复 grant 幂等、名称规整等
+      端到端用例）
+
+
+一、公开入口与按调用顺序的五个环节
+----------------------------------
+唯一授权入口是命令行：
+
+    python -m rbac --db FILE grant ROLE PERMISSION
+
+参数注册位置：rbac/__main__.py 的 _build_parser() 中 grant_parser
+（子命令名 "grant"，两个位置参数 role、permission）。
+
+一次调用从输入到输出严格按以下顺序执行（编排位置：
+rbac/__main__.py 的 main()）。
+
+1. 名称规整
+   argparse 取出原始参数后，main() 对 grant 取
+   raw_names = (args.role, args.permission)，并对两个名称逐个调用
+   policy.normalize_name(name)（rbac/policy.py normalize_name()）：
+   - 先 name.strip() 去除首尾空白（空格、制表符、换行等空白字符），
+     名称内部的空白原样保留——"a b" 与 "ab" 是两个不同名称；
+   - 规整后非空则返回该字符串，后续一律按完整字符串做大小写敏感的
+     精确匹配，不做大小写折叠，也没有任何通配语义——"*"、"%"、"_"
+     都只是普通字符（存储层的存在性查询与新增都使用带参数占位符的
+     等值比较，不使用 LIKE）；
+   - 入参为 None 或去除首尾空白后为空字符串时返回 None。
+   任一名称为 None 时，main() 立即经 _fail("invalid_name") 输出错误并
+   return 2。该分支在 store.connect() 之前：不打开、不创建数据库文件
+   或父目录，不触碰任何已有授权（main() 中该处注释为“不打开存储、
+   不改动任何已有授权”）。
+   核对位置：rbac/policy.py normalize_name()；rbac/__main__.py
+   main() 的 normalized 列表构造与 any(name is None ...) 校验段。
+
+2. 规则库准备
+   两个名称均有效后，main() 调用 store.connect(db_path)
+   （rbac/store.py connect()）：
+   - sqlite3.connect(db_path) 打开规则文件；父目录存在且可写而文件
+     不存在时，SQLite 会创建新文件（即“规则文件尚不存在”本身不是
+     错误）；父目录不存在等无法打开/创建的情况抛出 sqlite3.Error，
+     被包装为 StorageError；
+   - 连接建立后随即执行模块常量 _SCHEMA 并 commit：
+       CREATE TABLE IF NOT EXISTS role_permissions (
+           role       TEXT NOT NULL,
+           permission TEXT NOT NULL,
+           PRIMARY KEY (role, permission)
+       )
+     对结构正确的已有表，IF NOT EXISTS 为空操作，不改动既有表结构；
+   - 建表初始化中的任何 sqlite3.Error，connect() 先关闭连接再包装为
+     StorageError 抛出。
+   main() 在 connect 处捕获 StorageError：经 _fail("storage_error")
+   输出错误并 return 1。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中第一层 try/except store.StorageError。
+
+3. 重复规则判断
+   连接就绪后，grant 分支调用
+   store.grant_permission(conn, target_name, permission)
+   （rbac/store.py grant_permission()）。函数首先做一次精确查询：
+
+       SELECT 1 FROM role_permissions
+        WHERE role = ? AND permission = ? LIMIT 1
+
+   幂等性以“规整后的（角色, 权限）完整组合是否已存在”为准：
+   - 查询命中：该组合已经在库中，函数直接返回 False（含义：本次没有
+     新增行），不再执行 INSERT。这是幂等成功，不是失败；
+   - 查询未命中：进入第 4 步尝试新增。
+   这里刻意不使用 INSERT OR IGNORE：既有表可能带有与标准结构不同的
+   唯一约束或检查约束，INSERT OR IGNORE 会把这类约束拒绝一并吞掉，
+   在规则并未写入时仍报告成功（该函数 docstring 明确记录了这一取舍）。
+   核对位置：rbac/store.py grant_permission() 开头的 SELECT 段及其
+   docstring。
+
+4. 新增规则保存
+   组合不存在时，grant_permission() 执行普通 INSERT 并提交，随后
+   复查规则确实可被读出：
+
+       INSERT INTO role_permissions (role, permission) VALUES (?, ?)
+       conn.commit()
+       SELECT 1 FROM role_permissions
+        WHERE role = ? AND permission = ? LIMIT 1
+
+   只有“普通 INSERT 影响行数 cursor.rowcount 恰为 1，且提交后复查能
+   读回该组合”同时成立，函数才返回 True（含义：规则由本次实际新增并
+   持久保存）。INSERT、commit 或复查中的任何 sqlite3.Error（含唯一
+   约束、检查约束阻止写入、读写失败）都先 conn.rollback() 丢弃未提交
+   的部分写入，再包装为 StorageError 抛出；若语句无异常但
+   rowcount != 1 或复查读不到（写入未生效），同样抛出
+   StorageError("grant did not persist the rule")。
+   main() 内层 except 捕获 StorageError 后输出
+   {"error":"storage_error"} 并 return 1，finally 中关闭连接；原有
+   授权、其他表与既有表结构保持不变。
+   核对位置：rbac/store.py grant_permission() 的 INSERT/commit/复查段、
+   except sqlite3.Error 回滚段与 rowcount 复查；rbac/__main__.py
+   main() grant 分支内层 try/except store.StorageError 与 finally
+   conn.close()。
+
+5. 结果输出
+   无论第 3 步的“组合已存在”还是第 4 步的“实际新增”，main() 都组装
+   恰含两个字段、无多余字段的同一结果对象（布尔返回值不出现在命令行
+   输出中）：
+
+       {"role": 规整后的角色名, "permission": 规整后的权限名}
+
+   经 _emit() 写入标准输出：json.dumps 使用紧凑分隔符 (",", ":")、
+   ensure_ascii=False，末尾恰好追加一个换行；return 0，标准错误为空。
+   main() 开头还将 stdout/stderr reconfigure 为 UTF-8，保证任何区域
+   配置下输出按 UTF-8 编码。错误形态由 _fail() 以同样的紧凑 JSON 加
+   一个换行写到标准错误，且错误时标准输出为空。
+   核对位置：rbac/__main__.py main() grant 分支
+   （result = {"role": target_name, "permission": permission}）、
+   _emit()、_fail()、_SEPARATORS 及 main() 开头的 reconfigure 段。
+
+
+二、“授权成功”的含义：两种成功，同一种外部结果
+------------------------------------------------
+退出码 0 且输出 role/permission JSON 的准确含义是：调用结束后，规整
+后的（角色, 权限）组合确定存在于规则库中。它包含两种来源，命令行
+对外行为完全相同（退出码 0、stderr 为空、stdout 为同一行 JSON），
+差别只在库内是否多出一行：
+
+1. 已有组合：幂等成功
+   组合在第 3 步的精确查询中已命中，grant_permission() 返回 False，
+   不执行 INSERT，库中行数与内容不变。重复授权、并发下已被他人写入
+   等情形都落入此类。成功不依赖本次写入。
+2. 新增组合：实际保存后才算成功
+   组合原先不存在，普通 INSERT 提交后 rowcount 为 1 且复查可读回，
+   grant_permission() 返回 True，库中新增恰好一行。
+3. 反过来，组合不存在且未能实际保存（约束拒绝、读写失败、写入未生效）
+   时，绝不允许按成功输出：命令行结果只能是第四节的 storage_error
+   （退出码 1、stdout 为空）。返回值 True/False 仅在存储层可见，
+   CLI 不区分两种成功，也不输出 "created"、"idempotent" 之类字段。
+
+标准规则库（第 2 步 _SCHEMA 建立的复合主键）只约束
+(role, permission) 组合唯一，因此同一角色可以持有多个不同权限：
+(reader, documents:read) 与 (reader, documents:write) 可并存，
+后者是实际新增的成功。
+核对位置：rbac/store.py grant_permission() 的返回值与 docstring；
+tests/test_grant_permission_store.py
+test_sequential_grants_on_same_connection（重复授权返回 False、
+新增返回 True）；tests/test_grant_constraint.py
+test_standard_rulebase_allows_reader_read_and_write。
+
+
+三、授权与成员关系无关
+----------------------
+grant 的全部输入只有规整后的角色名与权限名，授权路径不读取、也不
+修改 rbac/policy.py 的 FIXED_MEMBER_ROLES：
+
+- 当前源码中唯一的固定成员关系是 "alice": ("reader",)
+  （rbac/policy.py FIXED_MEMBER_ROLES），它只保存在源码中、不入库，
+  没有登录、角色继承或成员管理；
+- 授权不要求角色绑定成员：对没有任何固定成员的角色（如 editor、
+  nobody）执行 grant，与对 reader 执行 grant 走的是同一段代码，
+  同样可以成功并落库；
+- 授权不会改变成员关系：无论授予还是授予失败，alice 与 reader 的
+  对应关系前后不变。rbac/store.py 模块 docstring 明确：数据库中只
+  保存“角色 -> 权限”这一类规则，固定成员与角色的对应关系不属于
+  可管理数据。
+
+核对位置：rbac/policy.py FIXED_MEMBER_ROLES 及其模块注释；
+rbac/store.py 模块 docstring；rbac/__main__.py main() grant 分支
+（不调用任何 members 相关函数）。
+
+
+四、两类失败及固定优先级
+------------------------
+三类结局互斥，优先级固定：名称校验（退出码 2）先于一切存储访问；
+规则库准备与业务读写失败（退出码 1）先于业务结论；两者都不是时才是
+退出码 0 的成功。两种失败都没有标准输出，标准错误都是一行紧凑 JSON
+加恰好一个换行，不附加错误详情或异常堆栈。
+
+1. 名称无效：退出码 2（invalid_name）
+   角色名或权限名经 strip() 后为空（""、"   "、"\t \n" 等，任一名称
+   为空即可）时：
+   - 退出码 2；
+   - 标准输出为空；
+   - 标准错误恰为 {"error":"invalid_name"} 加一个换行（25 字节，
+     末尾为 \n）；
+   - 不打开存储、不创建数据库文件或父目录，不改动任何已有授权。
+   即使同时给出父目录不存在的 --db 路径，仍以退出码 2 为准：名称
+   校验在 main() 中先于 store.connect()，存储错误根本没有机会发生。
+   对应测试：tests/test_non_sqlite_rulefile.py
+   test_grant_blank_role_or_permission_is_invalid_and_preserves_bytes；
+   tests/test_direct_role_flow.py 中的空名称用例。
+
+2. 存储失败：退出码 1（storage_error）
+   名称有效，但规则库无法打开、初始化，或新增规则未能实际保存时：
+   - 退出码 1；
+   - 标准输出为空（不得夹带 role/permission 成功 JSON）；
+   - 标准错误恰为 {"error":"storage_error"} 加一个换行。
+   按发生阶段分为两类：
+   a. 规则库无法打开或初始化（store.connect 阶段）：
+      父目录不存在导致文件无法创建；文件存在但内容不是 SQLite 数据库
+      （如连续 128 个 ASCII 字符 x）导致 CREATE TABLE IF NOT EXISTS
+      初始化失败。对应测试：
+      tests/test_non_sqlite_rulefile.py
+      test_grant_on_non_sqlite_file_is_storage_error_and_preserves_bytes
+      （失败前后文件字节完全相同，不被清空、截断或修补）。
+   b. 读写失败或新增被既有表约束拒绝（grant_permission 阶段）：
+      见下节“已有表额外约束拒绝新增为何属于存储失败”。
+
+3. 已有表额外约束拒绝新增为何属于存储失败
+   connect() 中的 CREATE TABLE IF NOT EXISTS 对既有表是空操作，因此
+   规则库允许 role_permissions 表带有标准复合主键之外的额外约束。
+   幂等判断只认“完整组合是否已存在”：目标组合不存在时，程序承诺的
+   是“实际持久保存后才算成功”。若额外约束使 INSERT 无法完成，规则
+   并未写入，这与磁盘读写失败在效果上同类——存储没有兑现调用所要求
+   的状态，因此统一按存储失败处理，而不能用 INSERT OR IGNORE 吞掉
+   约束冲突、在未写入时报告成功。
+   固定样例（tests/test_grant_constraint.py 与
+   test_grant_permission_store.py 共同固化）：既有表为
+
+       CREATE TABLE role_permissions (
+           role       TEXT NOT NULL UNIQUE,
+           permission TEXT NOT NULL
+       )
+
+   且 reader 已获授 documents:read（库中仅 (reader, documents:read)
+   一行）。此时执行 grant reader documents:write：
+   - 完整组合 (reader, documents:write) 在第 3 步查询中不存在，进入
+     INSERT；但 role 单列 UNIQUE 禁止同一 reader 出现第二行，INSERT
+     抛 sqlite3.IntegrityError；
+   - grant_permission() 回滚未提交写入并抛出 StorageError，命令行
+     退出码 1、stdout 为空、stderr 为 {"error":"storage_error"}\n；
+   - 原有授权仍只有 (reader, documents:read)，表结构（含那条额外
+     UNIQUE 约束）与其他表均保持不变；
+   - 随后再 grant reader documents:read 仍属幂等成功（退出码 0），
+     因为精确查询命中既有组合，根本不执行 INSERT，不会触发约束。
+   permission 列带 CHECK(permission <> 'documents:write') 的表行为
+   同理（test_check_constraint_rejects_forbidden_permission）。而在
+   标准复合主键表上，reader 可以正常新增 documents:write
+   （test_standard_rulebase_allows_reader_read_and_write）。
+
+
+五、验收示例
+------------
+以下三个示例均在编写本文时于独立临时目录 /tmp/grant-doc-demo 中
+实际执行（仓库源码未作任何改动；实跑命令为 python3 -m rbac，与
+python -m rbac 等价），结果为实际观察。未列出的输入输出（如第二、
+四节正文所述边界）为按源码推导的预期，未逐一实跑。
+
+示例 1（验收主样例，实际观察）：父目录存在、rules.db 尚不存在，
+连续两次授权同一组合。
+
+前置确认：/tmp/grant-doc-demo 目录存在且可写，其中没有 rules.db。
+
+第一次执行：
+
+    python -m rbac --db rules.db grant reader documents:read
+
+实际观察：
+    退出码：0
+    标准输出（一行，含末尾换行）：
+    {"role":"reader","permission":"documents:read"}
+    标准错误：空
+此时 store.connect() 创建 rules.db 并建好复合主键表，
+grant_permission() 精确查询未命中、INSERT 实际新增一行并复查可读回。
+
+第二次执行同一条命令：
+
+    python -m rbac --db rules.db grant reader documents:read
+
+实际观察：
+    退出码：0
+    标准输出（一行，含末尾换行）：
+    {"role":"reader","permission":"documents:read"}
+    标准错误：空
+第二次精确查询命中既有组合，属幂等成功，不执行 INSERT。
+
+库内核对（直接以 sqlite3 读取 rules.db）实际观察：
+    SELECT role, permission FROM role_permissions;
+    -> [('reader', 'documents:read')]
+即两次调用后库中仅有这一条授权；建表语句为标准的
+PRIMARY KEY (role, permission) 复合主键结构。
+（该样例与 tests/test_grant_constraint.py
+test_standard_rulebase_allows_reader_read_and_write 的新建库断言、
+tests/test_direct_role_flow.py
+test_grant_then_check_allowed_persisted_and_idempotent 同源。）
+
+示例 2（错误优先级，实际观察）：空白角色名与父目录不存在同时出现。
+
+前置确认：/tmp/grant-doc-demo/nodir 目录不存在（其父目录
+/tmp/grant-doc-demo 存在）。
+
+完整输入（角色参数为三个空格）：
+
+    python -m rbac --db /tmp/grant-doc-demo/nodir/rules.db \
+        grant "   " documents:read
+
+实际观察（确定输出）：
+    退出码：2
+    标准输出：空
+    标准错误（恰为一行，25 字节，末尾一个换行）：
+    {"error":"invalid_name"}
+调用后核对：/tmp/grant-doc-demo/nodir 目录仍不存在，rules.db 未被
+创建。依据：normalize_name("   ") 经 strip() 得到空串、返回 None，
+main() 在 store.connect() 之前即输出 invalid_name 并 return 2；
+“父目录不存在会导致 storage_error”的代码路径本轮不会被执行。
+（与 tests/test_non_sqlite_rulefile.py 中“名称校验优先于存储访问”
+的用例同一机理；该测试以非数据库文件证明同一优先级，本例以缺失父
+目录证明。）
+
+示例 3（额外约束拒绝新增，实际观察）：role 单列 UNIQUE 表上的存储
+失败，用于核对第四节第 3 点。
+
+前置准备（实际执行的建库语句；执行后 constraint.db 中仅一行）：
+
+    python3 -c "
+    import sqlite3
+    conn = sqlite3.connect('constraint.db')
+    conn.execute('CREATE TABLE role_permissions ('
+                 'role TEXT NOT NULL UNIQUE, permission TEXT NOT NULL)')
+    conn.execute(\"INSERT INTO role_permissions (role, permission) \"
+                 \"VALUES ('reader', 'documents:read')\")
+    conn.commit()"
+
+执行：
+
+    python -m rbac --db constraint.db grant reader documents:write
+
+实际观察：
+    退出码：1
+    标准输出：空
+    标准错误（一行，含末尾换行）：
+    {"error":"storage_error"}
+调用后直接读库实际观察：授权行仍只有
+[('reader', 'documents:read')]，建表语句仍为
+CREATE TABLE role_permissions (role TEXT NOT NULL UNIQUE,
+permission TEXT NOT NULL)，原授权与表结构均未改变。
+（对应 tests/test_grant_constraint.py
+test_unique_role_constraint_rejects_new_permission_with_storage_error
+与 tests/test_grant_permission_store.py
+test_sequential_grants_on_same_connection 的约束冲突段。）
+
+
+六、输出字节形态与核对指引
+--------------------------
+1. 成功（退出码 0）：标准错误为空；标准输出恰为一行紧凑 UTF-8 JSON
+   （分隔符为 "," 与 ":"，中文不转义）加恰好一个换行，不多行、不
+   缺换行。grant 成功对象只有 role、permission 两个键，不携带
+   “是否本次新增”的字段。
+2. 失败（退出码 2 或 1）：标准输出为空；标准错误恰为一行
+   {"error":"invalid_name"} 或 {"error":"storage_error"} 加一个
+   换行。
+3. 流程顺序与函数对应：名称规整 → policy.normalize_name()；规则库
+   准备（缺文件时创建）→ store.connect() 与 _SCHEMA；重复规则判断
+   → store.grant_permission() 的双列等值 SELECT；新增规则保存 →
+   同函数的普通 INSERT、conn.commit()、复查 SELECT 与 rowcount 校验；
+   成功输出 → main() grant 分支与 _emit()；两类失败 → main() 的两层
+   except 与 _fail()。
+4. 成功口径：退出码 0 只保证调用后该（角色, 权限）组合已在库中；
+   组合原本就存在（幂等）与本次实际新增对外无区别，新增组合只有
+   实际持久保存后才算成功。
+5. 数据边界：SQLite 文件只保存“角色 -> 权限”直接授权规则
+   （rbac/store.py _SCHEMA）；成员-角色关系仅存在于
+   rbac/policy.py 的 FIXED_MEMBER_ROLES（当前仅 alice -> reader），
+   不入库、无管理入口，grant 既不读取也不修改它。
+6. 第五节标注“实际观察”的示例可按同样步骤自行复验；tests/ 下用例
+   以子进程与存储层两种方式固化了同一协议，可从项目根目录执行
+   python -m unittest discover -s tests 完整回归。
+7. 本次交付仅新增 docs/单条直接授权流程说明.txt 这一个文件；业务
+   代码、测试、README、SQLite 数据库格式与全部公开命令的既有行为
+   保持原样。
+
+交付位置：docs/单条直接授权流程说明.txt（相对于仓库根目录）。
