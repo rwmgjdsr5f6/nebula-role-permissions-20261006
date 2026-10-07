@@ -1,0 +1,362 @@
+本地角色权限规则库 —— 单条授权撤销流程说明（revoke）
+====================================================
+
+文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态：
+名称规整、规则库准备、精确删除、提交与输出五个环节，以及撤销后用 check
+复核成员判定的完整链路。文中所有命令、输出与边界均为按当前源码逐一推导
+出的预期，不是某次实跑记录；可对照源码与 tests/ 下现有回归测试自行核对。
+本次交付仅新增本文件，不修改任何业务代码、测试、README、其他入口
+（grant、check、list-*、export-rules 等）的现有行为，也不改变 SQLite
+数据库格式。本文不描述成员管理、角色继承、通配权限等源码中不存在的能力。
+
+
+核对基准
+--------
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverB/task027
+  （即包含 rbac/ 包、docs/ 与 tests/ 的目录。）
+- 本流程直接依据的源码文件与函数：
+    rbac/__main__.py  —— main()、_build_parser()、_emit()、_fail()
+    rbac/policy.py    —— normalize_name()、roles_for()、decide()、
+                         FIXED_MEMBER_ROLES、REASON_PERMISSION_NOT_GRANTED
+                         等判定原因常量
+    rbac/store.py     —— connect()、revoke_permission()、
+                         permission_granted()、StorageError、_SCHEMA
+- 可对照的现有测试：
+    tests/test_direct_role_flow.py
+      （撤销已有授权、撤销不存在规则、不影响其他授权、名称规整与精确
+      匹配、非法名称、父目录不存在等用例）
+    tests/test_revoke_non_sqlite_rulefile.py
+      （非 SQLite 文件上的撤销存储失败；名称校验优先）
+    tests/test_incompatible_schema.py
+      （授权表缺少 permission 列时撤销按存储失败处理）
+
+
+一、公开入口与按调用顺序的五个环节
+----------------------------------
+唯一撤销入口是命令行：
+
+    python -m rbac --db FILE revoke ROLE PERMISSION
+
+参数注册位置：rbac/__main__.py 的 _build_parser() 中 revoke_parser
+（子命令名 "revoke"，两个位置参数 role、permission）。
+
+一次调用从输入到输出严格按以下顺序执行（编排位置：
+rbac/__main__.py 的 main()）。
+
+1. 名称规整
+   argparse 取出原始参数后，main() 对 revoke 取
+   raw_names = (args.role, args.permission)，并对两个名称逐个调用
+   policy.normalize_name(name)：
+   - 先 name.strip() 去除首尾空白（空格、制表符、换行等空白字符），
+     名称内部的空白原样保留；
+   - 规整后非空则返回该字符串，后续一律按完整字符串做大小写敏感的
+     精确匹配，不做大小写折叠，也没有任何通配语义——"*"、"%"、"_"
+     都只是普通字符（匹配使用带参数占位符的等值比较，不使用 LIKE）；
+   - 入参为 None 或去除首尾空白后为空字符串时返回 None。
+   任一名称为 None 时，main() 立即经 _fail("invalid_name") 输出错误并
+   return 2。该分支在 store.connect() 之前：不打开、不创建数据库文件
+   或父目录，不触碰任何已有授权（main() 中该处注释为“不打开存储、
+   不改动任何已有授权”）。
+   核对位置：rbac/policy.py normalize_name()；rbac/__main__.py
+   main() 的 normalized 列表构造与 any(name is None ...) 校验段。
+
+2. 规则库准备
+   两个名称均有效后，main() 调用 store.connect(db_path)：
+   - sqlite3.connect(db_path) 打开规则文件；父目录存在而文件不存在时，
+     SQLite 会创建新文件；
+   - 随即执行模块常量 _SCHEMA：
+       CREATE TABLE IF NOT EXISTS role_permissions (
+           role       TEXT NOT NULL,
+           permission TEXT NOT NULL,
+           PRIMARY KEY (role, permission)
+       )
+     并 commit。对结构正确的已有表，IF NOT EXISTS 为空操作；
+   - 连接建立或建表初始化中的任何 sqlite3.Error 统一包装为
+     StorageError；建表阶段失败时 connect() 内部先关闭连接再抛出。
+   main() 在 connect 处捕获 StorageError：经 _fail("storage_error")
+   输出错误并 return 1。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中第一层 try/except store.StorageError。
+
+3. 精确删除
+   连接就绪后，revoke 分支调用
+   store.revoke_permission(conn, target_name, permission)，执行：
+
+       DELETE FROM role_permissions
+        WHERE role = ? AND permission = ?
+
+   两个条件同时成立才会命中行：删除目标是“角色与权限的组合”，即
+   复合主键 (role, permission) 精确对应的那一条。角色不同或权限不同
+   的其他授权行均不满足 WHERE，不受影响。撤销既不删除成员，也不
+   删除、修改任何成员-角色关系——成员关系固定在
+   rbac/policy.py 的 FIXED_MEMBER_ROLES（当前仅 "alice": ("reader",)），
+   不入库，revoke 路径完全不读取该配置；角色是否绑定了成员、绑定了
+   谁，对撤销没有任何影响（对从未出现在固定配置中的角色执行撤销，与
+   对 reader 执行撤销走的是同一段代码）。
+   核对位置：rbac/store.py revoke_permission()；rbac/policy.py
+   FIXED_MEMBER_ROLES；rbac/store.py 模块 docstring（数据库只保存
+   “角色 -> 权限”规则）。
+
+4. 提交与删除判定
+   DELETE 执行成功后 revoke_permission() 调用 conn.commit() 提交，
+   并以 cursor.rowcount > 0 作为布尔返回值：
+   - 命中并实际删除了一条已有规则：返回 True；
+   - 组合本就不存在（角色从未授权、权限从未授予该角色，或同一规则
+     被重复撤销）：DELETE 影响零行，返回 False。这是正常业务结果，
+     不报错，也不区分“角色不存在”与“角色存在但无此权限”。
+   DELETE 执行或提交过程中的任何 sqlite3.Error 包装为 StorageError
+   （不吞掉约束或结构错误）；main() 内层 except 捕获后输出
+   {"error":"storage_error"} 并 return 1，随后 finally 关闭连接，
+   未提交的改动不落库。
+   核对位置：rbac/store.py revoke_permission()；rbac/__main__.py
+   main() revoke 分支内层 try/except store.StorageError 与 finally
+   conn.close()。
+
+5. 结果输出
+   成功时 main() 组装恰含三个字段、无多余字段的结果对象：
+
+       {"role": 规整后的角色名,
+        "permission": 规整后的权限名,
+        "revoked": 布尔值}
+
+   经 _emit() 写入标准输出：json.dumps 使用紧凑分隔符 (",", ":")、
+   ensure_ascii=False，末尾恰好追加一个换行；return 0，标准错误为空。
+   main() 开头还将 stdout/stderr reconfigure 为 UTF-8，保证任何区域
+   配置下输出按 UTF-8 编码。错误形态由 _fail() 以同样的紧凑 JSON 加
+   一个换行写到标准错误，且错误时标准输出为空。
+   核对位置：rbac/__main__.py _emit()、_fail()、_SEPARATORS 及
+   main() 开头的 reconfigure 段。
+
+
+二、撤销后用 check 复核：decide 的判定链路
+------------------------------------------
+撤销只改规则表，成员判定仍走 check 入口：
+
+    python -m rbac --db FILE check MEMBER PERMISSION
+
+main() 的 else（check）分支依次进行：
+1. policy.roles_for(member)：从 FIXED_MEMBER_ROLES 取成员的直接角色；
+   命中固定配置返回角色列表（alice 得到 ["reader"]），未命中返回 []。
+2. store.permission_granted(conn, roles, permission)：roles 为空时直接
+   返回 False、不查询规则表；非空时执行只读 SELECT，判定这些角色中
+   是否存在 permission 与请求权限精确相等（大小写敏感，"*"、"%"、"_"
+   为普通字符）的行。
+3. policy.decide(member, permission, granted) 结合二者给出结论：
+   - 角色列表为空        -> allowed=false，reason="成员未配置"；
+   - 有角色且 granted    -> allowed=true， reason="直接角色授权"；
+   - 有角色但 granted 为 false -> allowed=false，
+     reason="权限未授予"。
+   输出保持 check 既有的五字段 JSON 形态：
+   {"member", "permission", "roles", "allowed", "reason"}。
+   核对位置：rbac/policy.py roles_for()、decide()；
+   rbac/store.py permission_granted()；rbac/__main__.py main()
+   check 分支。
+
+
+三、主流程样例（按源码推导的预期）
+----------------------------------
+前提：父目录（当前工作目录）存在且可写。rules.db 中已存在且仅存在
+三条直接授权（例如先经三次 grant 写入；重复 grant 因幂等不产生重复
+行）：
+
+    (reader, documents:read)
+    (reader, documents:write)
+    (editor, documents:read)
+
+固定成员关系保持源码原样：alice 绑定 reader（且只绑定 reader）。
+以下两次成功调用均为：退出码 0，标准错误为空，标准输出恰为一行
+UTF-8 JSON 加一个末尾换行。
+
+1) 撤销 reader 的 documents:read：
+
+    python -m rbac --db rules.db revoke reader documents:read
+
+   预期标准输出（末尾一个换行）：
+
+    {"role":"reader","permission":"documents:read","revoked":true}
+
+   revoked 为 true：DELETE 的 WHERE role='reader' AND
+   permission='documents:read' 精确命中一条已有规则，提交后
+   rowcount 为 1。
+
+2) 随即查询 alice 是否拥有 documents:read：
+
+    python -m rbac --db rules.db check alice documents:read
+
+   预期标准输出（末尾一个换行）：
+
+    {"member":"alice","permission":"documents:read","roles":["reader"],"allowed":false,"reason":"权限未授予"}
+
+   保持 check 既有 JSON 格式：roles 仍为 ["reader"]——撤销不触碰
+   FIXED_MEMBER_ROLES，alice 与 reader 的固定关系不变；但
+   (reader, documents:read) 已从规则表删除，permission_granted()
+   在 reader 名下查不到该权限行，decide() 据此给出 allowed=false、
+   reason="权限未授予"。这是正常业务拒绝，不是执行失败，退出码
+   仍为 0。
+
+3) 另两条授权为何保留
+   DELETE 以 (role, permission) 双列等值为条件，复合主键只锁定
+   (reader, documents:read) 这一行：
+   - (reader, documents:write)：角色相同、权限不同，不满足
+     permission = 'documents:read'，保留；
+   - (editor, documents:read)：权限相同、角色不同，不满足
+     role = 'reader'，保留。
+   撤销后库中现存规则恰为这两条（可用
+   python -m rbac --db rules.db export-rules 核对，预期 rules 为
+   [{"role":"editor","permission":"documents:read"},
+    {"role":"reader","permission":"documents:write"}]）。
+
+4) editor 的同名权限为何不能让 alice 获准
+   check 判定先经 roles_for("alice") 得到固定角色 ["reader"]，
+   permission_granted() 的只读查询只在 role IN ('reader') 范围内
+   匹配权限；库中虽仍有 (editor, documents:read)，但 editor 不在
+   alice 的角色列表中，该行不参与匹配，granted 为 false。本产品
+   没有角色继承或权限转借：editor 持有同名权限不会让仅绑定 reader
+   的 alice 连带获准。alice 要重新获得 documents:read，只能恢复
+   reader 对该权限的直接授权（重新 grant reader documents:read
+   后 check 即恢复 allowed=true）。
+   作为对照，reader 保留的 documents:write 仍可让 alice 获准：
+   check alice documents:write 预期为
+   {"member":"alice","permission":"documents:write","roles":["reader"],"allowed":true,"reason":"直接角色授权"}。
+
+
+四、重复撤销、不存在组合与成员绑定无关
+--------------------------------------
+1. 重复撤销与不存在的组合：revoked 为 false
+   规则不存在时 DELETE 影响零行，commit 照常完成，退出码 0，例如：
+   - 紧接第三节第 1 步再次执行
+     revoke reader documents:read：预期
+     {"role":"reader","permission":"documents:read","revoked":false}；
+   - 对从未授权的组合（如 revoke nobody documents:read，或撤销
+     三条授权建立之前的 reader/documents:read）同样返回 revoked 为
+     false，不另报“角色不存在”。
+   revoked 为 false 只表示“本次没有删除到行”，不是错误；不能与
+   第五节的存储失败混用——存储失败时退出码为 1、标准输出为空，
+   绝不输出 revoked 字段（含 revoked:false）。
+   对应测试：tests/test_direct_role_flow.py
+     test_revoke_missing_rule_returns_false
+     test_revoke_existing_grant_denies_and_persists（先 true 后可
+     重新授予）。
+
+2. 角色是否绑定成员不影响撤销
+   revoke 的全部输入只有规整后的角色名与权限名，执行路径不读取
+   FIXED_MEMBER_ROLES：
+   - 撤销没有任何成员的角色（如 editor、ghost、nobody）的授权，与
+     撤销 reader 的授权行为完全一致，命中即 true、未命中即 false；
+   - 撤销也不会反向改动成员关系：alice 在撤销前后始终是
+     roles=["reader"]，删除 reader 的权限不会删除或解绑 alice。
+   入库数据自始至终只有 role_permissions 表中的“角色 -> 权限”行。
+   对应测试：test_revoke_does_not_touch_other_grants（撤销 reader
+   一条后 editor 授权与 reader 的其他授权均不变）。
+
+
+五、名称匹配口径与两类失败的区分
+--------------------------------
+三类结局互斥，优先级固定：名称校验（退出码 2）先于一切存储访问；
+规则库准备与业务读写失败（退出码 1）先于业务结论；两者都不是时才是
+退出码 0 的正常结果。
+
+1. 名称规整与精确匹配（正常匹配语义）
+   - 只去首尾空白，不折叠大小写：输出 JSON 中的 role、permission
+     一律为规整后的值。"  reader\t" 与 "reader" 命中同一规则；
+     "Reader" 不命中 "reader"，"documents:Read" 不命中
+     "documents:read"，此类请求若库中无对应组合，结果是 revoked 为
+     false，而非删错行；
+   - "*"、"%"、"_" 均为普通字符：revoke reader "documents:*" 或
+     "documents:%" 不会匹配 documents:read，返回 revoked 为 false，
+     已有的 documents:read 保留；
+   - 名称内部空白原样保留（"a b" 与 "ab" 是两个名称）。
+   对应测试：test_revoke_trims_whitespace_and_matches_exactly。
+
+2. 名称无效：退出码 2（invalid_name）
+   角色名或权限名经 strip() 后为空（""、"   "、"\t \n" 等，任一名
+   称即可，两个位置分别覆盖）时：
+   - 退出码 2；
+   - 标准输出为空；
+   - 标准错误恰为一行 {"error":"invalid_name"} 加一个换行，无堆栈；
+   - 不打开、不创建数据库文件或父目录，不改动任何已有授权。
+   即使同时给出父目录不存在的 --db 路径，仍以退出码 2 为准，因为
+   名称校验在 main() 中先于 store.connect()。
+   对应测试：test_revoke_empty_or_blank_names_are_invalid、
+   test_revoke_invalid_name_does_not_change_existing_grants、
+   test_revoke_invalid_name_takes_precedence_over_storage_error；
+   tests/test_revoke_non_sqlite_rulefile.py 中对非数据库文件的
+   blank 名称用例同样证明该优先级。
+
+3. 存储失败：退出码 1（storage_error）
+   名称有效，但规则库无法打开、初始化或完成删除时：
+   - 退出码 1；
+   - 标准输出为空（不得夹带 revoked:true/false 等任何业务 JSON）；
+   - 标准错误恰为一行 {"error":"storage_error"} 加一个换行，
+     不附加错误详情或异常堆栈。
+   以下三种输入均落入这一协议，且失败发生的阶段不同：
+
+   a. 父目录不存在
+      --db 所在目录不存在，规则文件无法创建：sqlite3.connect 抛出
+      错误，connect() 包装为 StorageError，失败发生在规则库准备
+      阶段。
+      对应测试：test_revoke_missing_parent_directory_is_storage_error。
+
+   b. 文件存在但内容不是 SQLite 数据库
+      例如文件内容固定为连续 128 个 ASCII 字符 x、从未经 SQLite
+      初始化。sqlite3 可以建立连接，但 connect() 内的
+      CREATE TABLE IF NOT EXISTS 建表初始化必然失败并包装为
+      StorageError；该失败先于 revoke 分支，文件原有字节不被清空、
+      覆盖、截断或修补，同一文件上连续两次撤销各自独立失败。
+      对应测试：tests/test_revoke_non_sqlite_rulefile.py
+      （test_revoke_plain_valid_names_is_storage_error_and_preserves_bytes
+      等）。
+
+   c. 授权表缺少 permission 列，但初始化可以完成
+      role_permissions 表已存在但结构不兼容（例如只有 role 列、
+      缺少 permission 列，CREATE TABLE role_permissions
+      (role TEXT) 并存有 reader 行）时，CREATE TABLE IF NOT EXISTS
+      对既有表是空操作，connect() 正常返回；随后
+      revoke_permission() 的
+      DELETE ... WHERE role = ? AND permission = ? 必须引用
+      permission 列，缺列使语句在执行时抛出 sqlite3.Error，包装为
+      StorageError。结果必须是退出码 1、stdout 为空、stderr 仅为
+      {"error":"storage_error"} 加换行；不能退化为
+      revoked:false 的正常结果，失败后表结构与数据保持不变。
+      对应测试：tests/test_incompatible_schema.py
+      test_revoke_incompatible_schema_is_storage_error_and_preserves_data。
+
+4. 缺文件但父目录存在且可写：初始化为空规则库，revoked 为 false
+   名称有效、父目录存在且可写而 rules.db 尚不存在时，“文件缺失”
+   不是错误：connect() 创建文件并建好 role_permissions 空表，随后
+   DELETE 在空表上命中零行、提交完成，revoke 以退出码 0 返回
+
+    {"role":"reader","permission":"documents:read","revoked":false}
+
+   即：父目录存在可写时，缺失文件会被创建为空规则库，对不存在组合
+   的撤销返回 revoked 为 false。新建的库可直接用于后续 grant。
+   对照：父目录本身不存在时创建失败，属于上条 a 的 storage_error。
+   对应测试：test_revoke_missing_rule_returns_false（新建库场景）。
+
+
+六、输出字节形态与核对指引
+--------------------------
+1. 成功（退出码 0）：标准错误为空；标准输出恰为一行紧凑 UTF-8 JSON
+   （分隔符为 "," 与 ":"，中文不转义）加恰好一个换行，不多行、不
+   缺换行。revoke 成功对象只有 role、permission、revoked 三个键；
+   check 对象保持 member、permission、roles、allowed、reason 五个
+   键的既有形态。
+2. 失败（退出码 2 或 1）：标准输出为空；标准错误恰为一行
+   {"error":"invalid_name"} 或 {"error":"storage_error"} 加一个
+   换行。
+3. 流程顺序与函数对应：名称规整 → policy.normalize_name()；规则库
+   准备 → store.connect()；精确删除 → store.revoke_permission()
+   的双列等值 DELETE；提交与 true/false → conn.commit() 与
+   cursor.rowcount；输出 → main()/_emit()；撤销后的成员判定 →
+   policy.roles_for()、store.permission_granted()、policy.decide()。
+4. 数据边界：SQLite 文件只保存“角色 -> 权限”直接授权规则
+   （rbac/store.py _SCHEMA）；成员-角色关系仅存在于
+   rbac/policy.py 的 FIXED_MEMBER_ROLES，不入库、无管理入口，
+   revoke 既不读取也不修改它。
+5. 第三节的固定三授权样例与第五节各边界均为按当前源码推导的预期，
+   非实跑记录；tests/ 下用例以子进程方式固化了同一协议，可用
+   python -m unittest discover -s tests 自行复验。
+6. 本次交付仅新增 docs/单条授权撤销流程说明.txt 这一个文件；业务
+   代码、测试、README、其他公开入口及 SQLite 数据库格式保持原样。
+
+交付位置：docs/单条授权撤销流程说明.txt（相对于仓库根目录）。
