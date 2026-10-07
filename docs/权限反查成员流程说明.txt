@@ -1,0 +1,389 @@
+本地角色权限规则库 —— 权限反查成员流程说明（list-permission-members）
+====================================================================
+
+文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态，
+所有流程、样例与错误边界均为按当前源码与已有测试逐条推导出的预期，
+不是某次实跑记录，本文不把任何预期冒充实测结论。本次交付仅新增本文件，
+不修改任何业务代码、测试、README、SQLite 文件格式，也不改变任何公开
+命令（python -m rbac 各子命令）的现有行为。本文不描述成员管理、角色
+继承等源码中不存在的能力。
+
+
+核对基准
+--------
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverB/task026
+  （即包含 rbac/ 包、docs/ 与 tests/ 的目录。）
+- 本流程直接相关的源码文件与函数：
+    rbac/__main__.py  命令行入口：_build_parser()（参数注册）、
+                      main()（名称校验、调用编排、退出码与输出）、
+                      _emit()、_fail()、常量 _SEPARATORS
+    rbac/policy.py    normalize_name()（名称规整）、
+                      members_for_permission()（固定成员匹配的纯内存计算）、
+                      FIXED_MEMBER_ROLES（固定成员 -> 直接角色配置）
+    rbac/store.py     connect()、_SCHEMA、StorageError（规则库准备）、
+                      list_roles_for_permission()（按权限反查获授角色）
+- 本流程直接相关的已有测试：
+    tests/test_list_permission_members.py
+      （通过 python -m rbac 子进程走完整公开入口的回归测试，含全部
+      错误边界用例）
+    tests/test_policy_permission_members.py
+      （直接调用 rbac.policy.members_for_permission 的纯计算单元测试，
+      在合成固定成员配置下核对去重、码点排序与成员项形态）
+- 数据模型边界（rbac/store.py 模块 docstring、rbac/policy.py
+  FIXED_MEMBER_ROLES 上方注释及 README.md“数据模型”一节一致）：
+  SQLite 中只保存“角色 -> 权限”这一类直接授权规则（role_permissions
+  表）；固定成员与角色的对应关系不属于可管理数据，不入库，也没有任何
+  命令可以修改它。当前固定配置只有一项：alice 绑定直接角色 reader。
+
+
+一、公开入口与按调用顺序的四个环节
+----------------------------------
+唯一公开入口是命令行：
+
+    python -m rbac --db FILE list-permission-members PERMISSION
+
+参数注册位置：rbac/__main__.py 的 _build_parser() 中
+permission_members_parser（子命令名 "list-permission-members"，单个
+位置参数 permission）；help 文案为“按直接授权与固定成员关系列出某项
+权限的获准成员”。
+
+一次调用从输入到输出严格按以下四个环节执行（编排位置：
+rbac/__main__.py 的 main()）。
+
+环节 1：名称规整
+   命令行参数 permission 先经 rbac/policy.py 的 normalize_name(name)
+   处理：
+   - name.strip() 去除首尾空白（空格、制表符、换行等空白字符）；
+   - 规整后非空则返回规整后的字符串，后续一律按完整字符串大小写敏感
+     精确匹配，不做大小写折叠；输出中的 permission 字段使用规整后的
+     名称；
+   - 入参为 None，或去除首尾空白后为空字符串时返回 None。
+   main() 对本命令取 raw_names = (args.permission,)（见
+   rbac/__main__.py main() 中 elif args.command ==
+   "list-permission-members" 分支对 raw_names 的赋值）。规整结果为
+   None 时，立即经 _fail("invalid_name") 向标准错误写入
+   {"error":"invalid_name"} 加一个换行，return 2。该分支发生在
+   store.connect() 之前：不打开存储、不创建数据库文件或父目录，
+   不改动任何已有授权（main() 该处注释为“不打开存储、不改动任何
+   已有授权”）。
+   核对位置：rbac/policy.py normalize_name()；rbac/__main__.py
+   main() 中 normalized 列表构造与 any(name is None ...) 校验段、
+   _fail()。
+
+环节 2：规则库准备（打开连接、确保表结构）
+   名称有效后，main() 调用 rbac/store.py 的 connect(db_path)：
+   - sqlite3.connect(db_path) 打开规则文件；父目录存在而文件不存在时，
+     SQLite 创建新文件；
+   - 随即执行模块常量 _SCHEMA：
+       CREATE TABLE IF NOT EXISTS role_permissions (
+           role       TEXT NOT NULL,
+           permission TEXT NOT NULL,
+           PRIMARY KEY (role, permission)
+       )
+     并 commit；对结构正确的已有表，IF NOT EXISTS 为空操作；
+   - 连接建立或建表初始化中的任何 sqlite3.Error 统一包装为
+     StorageError；建表阶段失败时 connect() 内部先关闭连接再抛出。
+   main() 在 connect 调用处捕获 StorageError：经 _fail("storage_error")
+   向标准错误写入 {"error":"storage_error"} 加换行，return 1。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中第一层 try/except store.StorageError。
+
+环节 3：授权角色查询（按权限反查直接获授角色）
+   连接就绪后，main() 的 list-permission-members 分支先调用
+   rbac/store.py 的 list_roles_for_permission(conn, target_name)：
+       roles = store.list_roles_for_permission(conn, target_name)
+   - 执行只读查询
+       SELECT role FROM role_permissions WHERE permission = ?
+     参数以绑定方式传入，SQL 中是 "=" 精确比较而非 LIKE：权限按完整
+     名称大小写敏感精确匹配，"*"、"%"、"_" 均为名称中的普通字符，
+     不做任何通配匹配；
+   - 查询结果先经集合去重（同一 (role, permission) 组合由复合主键
+     保证只存一行，去重是输出口径的双保险），再用 Python sorted() 按
+     角色完整名称的 Unicode 码点升序排列；角色名按库里保存值原样
+     返回、保留大小写；
+   - 该权限从未授予、或授权已全部撤销时返回空列表 []；
+   - 本函数只看“角色 -> 权限”授权，不感知成员：角色是否绑定了固定
+     成员完全不影响本层结果（因此 editor 获授某权限时会在此层返回
+     ["editor"]，是否产生成员留待环节 4 决定）；
+   - 查询中的 sqlite3.Error（例如规则表缺少查询所需的 role 或
+     permission 列）包装为 StorageError，由 main() 内层
+     except store.StorageError 捕获：标准错误写入
+     {"error":"storage_error"} 加换行，return 1。
+   核对位置：rbac/store.py list_roles_for_permission()；
+   rbac/__main__.py main() 中包在业务 try 内的内层
+   except store.StorageError。
+
+环节 4：固定成员匹配与 JSON 输出
+   main() 接着调用 rbac/policy.py 的
+   members_for_permission(roles)（纯内存计算，不访问存储）：
+       members = policy.members_for_permission(roles)
+   - 以环节 3 返回的“直接获授目标权限的角色集合”为输入，遍历模块级
+     固定配置 FIXED_MEMBER_ROLES（当前仅 {"alice": ("reader",)}）；
+   - 对每个固定成员，取“该成员绑定的直接角色”与“获授角色集合”的
+     交集：交集非空才产生一个成员项，成员项形如
+       {"member": 成员名, "roles": 命中该权限的直接角色列表}
+     roles 仅含该成员自己绑定、且直接获授目标权限的角色；该成员
+     绑定但未获授该权限的角色不出现，获授角色中没有任何成员绑定的
+     （如 editor）被忽略，不产生成员；
+   - 成员与各自的 roles 分别去重，并分别按完整名称的 Unicode 码点
+     升序排列（Python sorted()）；名称按固定配置原样返回、保留大小
+     写；当前固定配置下成员至多 alice 一个；
+   - 无任何固定成员命中（输入为空、只有未绑定成员的角色、或成员
+     绑定的角色均未获授）时返回空列表 []。
+   随后 main() 组装结果对象，字段恰为两个、无多余字段：
+       {"permission": 规整后的权限名, "members": 成员项列表}
+   每个成员项键恰为 member、roles 两个。结果经 _emit() 写入标准
+   输出：json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+   （紧凑 UTF-8 JSON，键值间与元素间无空白，非 ASCII 字符不转义）
+   后追加恰好一个换行；return 0，标准错误为空。main() 开头还把
+   stdout/stderr reconfigure 为 UTF-8，保证任何区域配置下都按 UTF-8
+   输出。无论成功失败，finally 中都执行 conn.close()。
+   核对位置：rbac/policy.py members_for_permission()、
+   FIXED_MEMBER_ROLES；rbac/__main__.py main() 的
+   list-permission-members 分支、_emit()、_fail()、_SEPARATORS。
+
+
+二、固定样例核对（主路径，预期可逐条复现）
+------------------------------------------
+前提：父目录存在且可写。rules.db 中恰有两条与读取相关的直接授权
+（可经 grant 子命令写入；重复 grant 同一 (role, permission) 组合按
+幂等成功处理，不产生重复行）：
+
+    python -m rbac --db rules.db grant reader documents:read
+    python -m rbac --db rules.db grant editor documents:read
+
+即 reader、editor 两个角色均直接获授 documents:read；
+documents:write 从未授予任何角色。固定成员配置仍只有 alice -> reader，
+editor 未绑定任何成员。
+
+1) 反查 documents:read：
+
+    python -m rbac --db rules.db list-permission-members documents:read
+
+   预期：退出码 0；标准错误为空；标准输出恰为一行紧凑 UTF-8 JSON
+   加一个末尾换行：
+
+    {"permission":"documents:read","members":[{"member":"alice","roles":["reader"]}]}
+
+   推导：环节 3 由 role_permissions 表得到获授角色
+   ["editor", "reader"]（码点序 editor < reader）；环节 4 中只有
+   alice 绑定了其中的 reader，故成员列表只有 alice 一项，其 roles
+   仅含命中该权限的直接角色 ["reader"]；editor 在固定配置中没有
+   对应成员，不产生任何成员项。
+
+2) 改查 documents:write：
+
+    python -m rbac --db rules.db list-permission-members documents:write
+
+   预期：退出码 0；标准错误为空；标准输出恰为一行 JSON 加换行：
+
+    {"permission":"documents:write","members":[]}
+
+   推导：documents:write 未授予任何角色，环节 3 返回 []，环节 4
+   无成员可命中。这是权限未授予导致的正常空结果（退出码 0），不是
+   执行失败。
+
+3) 仅剩 editor 获授 documents:read（例如撤销 reader 的该授权，或在
+   空库上只 grant editor documents:read）：
+
+    python -m rbac --db rules.db revoke reader documents:read
+    python -m rbac --db rules.db list-permission-members documents:read
+
+   预期反查输出为：
+
+    {"permission":"documents:read","members":[]}
+
+   退出码 0、标准错误为空。editor 直接获授该权限，但没有任何固定
+   成员绑定 editor，获授角色不产生成员；这与“权限从未授予”的空
+   数组在输出形态上一致，都是正常空结果。
+   对应测试（tests/test_list_permission_members.py）：
+     test_permission_granted_only_to_unbound_role_returns_empty_members
+       （只授给未绑定成员的 editor：空成员数组）
+     test_revoke_reader_read_narrows_lookup_and_persists_on_reopen
+       （撤销 reader 后只剩 editor：反查即时收窄为空，重开同一库
+       结果一致）
+
+4) 样例对应的验收测试：
+     tests/test_list_permission_members.py
+       test_acceptance_read_returns_alice_with_reader_write_empty
+         （reader 获授 read/write、editor 获授 read：read 反查只得
+         alice 且 roles 为 ["reader"]，editor 不产生成员；并断言
+         成员不重复、成员内 roles 去重且按码点升序）
+       test_other_permissions_grants_are_not_mixed_in
+         （其他权限（如 editor 的 documents:export）的授权不混入
+         documents:read 的反查）
+       test_never_granted_or_fully_revoked_returns_empty_members
+         （空库反查从未授予的权限、或授权全部撤销后：空成员数组）
+       test_permission_query_is_read_only
+         （反查为只读：多次查询前后 role_permissions 全部授权记录
+         一致，不改已有授权）
+
+
+三、名称匹配口径：规整、大小写、通配字符与排序
+------------------------------------------------
+1. 首尾空白：权限名先 strip，再按规整后的完整字符串匹配，输出中的
+   permission 字段也使用规整后的名称。例如库中 reader 获授
+   documents:read 时，以 "\t documents:read \n" 查询与以
+   "documents:read" 查询等价，输出 permission 均为
+   "documents:read"，members 均为
+   [{"member":"alice","roles":["reader"]}]。
+   对应测试：test_permission_name_surrounding_whitespace_is_trimmed。
+
+2. 大小写敏感："DOCUMENTS:READ" 与 "documents:read" 是两个不同的
+   权限名，前者未授予时返回 {"permission":"DOCUMENTS:READ",
+   "members":[]}，退出码 0。
+   对应测试：test_wildcard_chars_are_literal_and_match_is_case_sensitive
+   中对 DOCUMENTS:READ 的子核对。
+
+3. "*"、"%"、"_" 为普通字符：SQL 以参数绑定做 "=" 精确比较，不做
+   LIKE 通配。例如只授予 reader "docs:*_%read" 时：
+   - 查 "docs:*_%read" 命中 alice（roles ["reader"]）；
+   - 查 "docs:%read"、"docs:*_read"、"docs:X_%read"、
+     "docs:*_%READ" 均返回空成员数组（前者少一个通配字符段，
+     后者大小写不同）。
+   对应测试：test_wildcard_chars_are_literal_and_match_is_case_sensitive。
+
+4. 去重与排序的通用口径：成员不重复；每个成员项的 roles 去重；成员
+   之间、成员内角色之间分别按完整名称的 Unicode 码点升序排列，名称
+   原样保留大小写。当前默认固定配置只有 alice -> reader，CLI 层只能
+   观察到单成员、单角色；多成员、多角色、重复角色的口径由单元测试
+   在合成固定成员配置下钉死：
+     tests/test_policy_permission_members.py
+       GRANTED_ROLES = ["reader", "ghost", "editor", "reader"]
+       合成配置 alice: reader/editor/reader（含重复）、bob: editor、
+       Carol: reader、dave: writer、empty: 无角色；
+       members_for_permission(GRANTED_ROLES) 恰为
+         [{"member":"Carol","roles":["reader"]},
+          {"member":"alice","roles":["editor","reader"]},
+          {"member":"bob","roles":["editor"]}]
+       —— 成员按码点序 "Carol"(U+0043 起) < "alice" < "bob"，
+       alice 的 roles 按码点序 editor < reader 且重复 reader 只留
+       一个；ghost 未绑定成员不产生项；dave 的 writer 未获授、
+       empty 无角色，均不进入结果。
+   对应用例：test_full_expected_result、
+   test_result_shape_dedup_and_ordering、
+   test_input_permutation_and_duplicates_do_not_change_result、
+   test_empty_or_only_unbound_roles_return_empty、
+   test_exact_name_matching_without_normalization（本层按名称精确
+   匹配，"Reader"、" reader " 等均不命中；命令行层的 strip 只发生
+   在环节 1）。test_default_config_is_alice_reader 钉死默认配置恢复
+   后恰为 {"alice": ("reader",)}，且 members_for_permission(["reader"])
+   得 alice、members_for_permission(["editor"]) 得 []。
+
+
+四、空结果与失败的区分（错误边界逐条可核对）
+--------------------------------------------
+本命令有三种性质不同的结局，退出码与输出通道各不相同：成功且有成员
+（退出码 0，结果在 stdout）、成功但空成员（退出码 0，stdout 是含
+"members":[] 的 JSON）、失败（退出码 1 或 2，stdout 必须为空，
+错误在 stderr）。特别注意：“权限未授予/角色未绑定成员导致的空成员
+数组”是正常业务结果，绝不能与“存储读不出导致的失败”混淆。
+
+1. 空或纯空白权限名：invalid_name（退出码 2，不打开数据库）
+   permission 为 ""、"   "、"\t \n" 等时：
+   - 退出码 2；
+   - 标准输出为空；
+   - 标准错误恰为一行 {"error":"invalid_name"} 加一个末尾换行，
+     无堆栈、无其他内容；
+   - 不创建数据库文件或父目录，不改动任何已有授权。
+   即使同时给出父目录不存在的 --db 路径，名称校验（环节 1）先于
+   规则库准备（环节 2），仍优先得到 invalid_name 且不创建父目录。
+   对应测试（tests/test_list_permission_members.py）：
+     test_empty_or_blank_permission_is_invalid_and_creates_no_database
+     test_invalid_permission_does_not_change_existing_grants
+     test_invalid_name_takes_precedence_over_missing_parent_directory
+
+2. 父目录存在且可写、规则文件缺失：查询初始化空库（退出码 0）
+   名称有效、父目录存在但 rules.db 尚不存在时，connect() 创建文件
+   并执行建表语句；随后环节 3 在空表上反查得到 []，环节 4 得到空
+   成员数组。标准输出恰为：
+
+    {"permission":"documents:read","members":[]}
+
+   加一个换行；退出码 0、标准错误为空。新建的库可直接用于后续
+   grant 与再次查询（授权后再查即可看到 alice）。本命令是只读查询，
+   不改已有授权；文件缺失场景下的“写”仅发生在 connect() 的一次性
+   建库建表，不写入任何授权行。
+   对应测试：
+     test_missing_db_with_existing_parent_is_created_and_returns_empty
+       （文件被创建；随后 grant reader documents:read 再查即得
+       alice）
+     test_permission_query_is_read_only
+       （已有授权在查询前后逐条一致）
+
+3. 名称有效但存储不可用：storage_error（退出码 1）
+   以下三种情形名称均已通过校验，失败统一为：退出码 1；标准输出
+   为空（不得夹带任何成功 JSON 或 "members" 字样）；标准错误恰为
+   一行 {"error":"storage_error"} 加一个末尾换行，不附加错误详情
+   或 Traceback：
+   a. 父目录不存在：sqlite3.connect 在缺失目录下创建文件失败，
+      包装为 StorageError（环节 2）。
+      对应测试：test_valid_name_with_missing_parent_directory_is_storage_error。
+   b. 文件存在但不是 SQLite 数据库：预置文件内容为连续 128 个
+      ASCII 字符 x（无 "SQLite format 3" 头部）。sqlite3.connect
+      可建立连接，但 connect() 内 CREATE TABLE IF NOT EXISTS
+      初始化必然失败并包装为 StorageError（环节 2）；调用前后文件
+      字节完全相同，仍是那 128 个 x：失败不清空、不覆盖、不截断、
+      不修补文件。
+      对应测试：test_non_sqlite_file_is_storage_error。
+   c. 规则表缺查询所需列：文件是可正常打开的 SQLite 库，但其中
+      role_permissions 表结构不兼容（测试预置为
+      CREATE TABLE role_permissions (a TEXT, b TEXT)）。
+      CREATE TABLE IF NOT EXISTS 对同名已有表为空操作，环节 2 不
+      报错；失败发生在环节 3：SELECT role ... WHERE permission = ?
+      触碰 role、permission 列，缺列抛出 sqlite3.Error 并包装为
+      StorageError。不得用空成员数组把该失败伪装成“权限未授予”。
+      对应测试：test_incompatible_schema_missing_column_is_storage_error。
+
+4. 输出约定汇总
+   - 成功（含空成员结果）：退出码 0；标准错误为空；标准输出为一行
+     UTF-8 JSON（json.dumps(ensure_ascii=False, separators=(",",":"))
+     的紧凑形态）加恰好一个末尾换行；顶层键恰为 permission、members，
+     成员项键恰为 member、roles。
+   - invalid_name：退出码 2；标准输出为空；标准错误为一行
+     {"error":"invalid_name"} 加换行；全程不触碰存储。
+   - storage_error：退出码 1；标准输出为空；标准错误为一行
+     {"error":"storage_error"} 加换行。
+
+
+五、存储边界与流程次序小结
+--------------------------
+- 入库的只有“角色 -> 权限”直接授权规则（role_permissions 表，
+  复合主键 (role, permission)）；FIXED_MEMBER_ROLES（当前仅
+  alice -> reader）是 rbac/policy.py 中的固定内存配置，不入库、
+  无管理入口，grant/revoke 及任何其他命令都不改变它。
+- list-permission-members 的判定链是“权限 -> 直接获授角色
+  （store，查 SQLite）-> 固定成员（policy，纯内存交集）”：
+  成员项 roles 只含命中目标权限的直接角色；获授角色若未绑定任何
+  固定成员则被忽略，不产生成员。
+- 调用次序决定边界行为：名称规整（可能退出码 2，先于一切存储
+  操作）先于规则库准备（connect/建表，可能退出码 1），规则库
+  准备先于授权角色查询（缺列等读失败在此处成为退出码 1），最后
+  才是不接触存储的固定成员匹配与 JSON 输出。
+- 本命令为只读查询：不写入、不删除授权；但它与其他子命令共用
+  connect()，在文件缺失且父目录存在且可写时会创建文件并建表，
+  然后返回空成员数组。
+- 不存在登录、角色继承、通配权限或成员管理；"*"、"%"、"_" 在
+  名称匹配中均为普通字符，本文不将规划方向描述为已实现能力。
+
+
+六、验收口径
+------------
+1. 以源码为准：四个环节、调用次序与退出码见第一节标注的文件与
+   函数；对外字节形态（stdout/stderr、末尾换行）见第二、四节。
+2. 以样例预期与源码一致为验收口径：第二节的固定样例（reader 与
+   editor 均获授 documents:read、documents:write 未授予、仅剩
+   editor 授权）给出的预期输出均为逐字形态，可手工执行复现；
+   本文将其明确表述为按源码与已有测试推导出的预期，未冒充实测
+   记录。
+3. 已有测试是场景化核对清单：第一至四节每一关键分支（主路径、
+   未绑定成员不收敛、其他权限不混入、撤销收窄与持久化、未授予/
+   全撤销空结果、空白规整、大小写敏感、通配字符普通化、去重与
+   码点排序、只读、缺文件建空库、空名称退出码 2、父目录缺失/
+   非 SQLite/缺列退出码 1）均在文中标注了对应测试文件与用例名，
+   可用 python -m unittest discover -s tests 自行核对。
+4. 本次交付仅新增本文件（docs/权限反查成员流程说明.txt），未
+   修改、新增或删除任何业务代码、测试、README、SQLite 文件格式
+   或其他公开命令的行为。
+
+交付位置：docs/权限反查成员流程说明.txt（相对于仓库根目录）。
