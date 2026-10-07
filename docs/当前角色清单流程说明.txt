@@ -1,0 +1,292 @@
+本地角色权限规则库 —— 当前角色清单流程说明（list-roles）
+==================================================================
+
+文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态，
+所有示例、分支与存储边界均可对照当前源码逐一核对。本次交付仅新增本文件，
+不修改任何业务代码、测试、README、SQLite 数据格式，也不改变任何公开命令
+（python -m rbac 各子命令）的现有行为、JSON 字段或输出形态。
+
+
+核对基准
+--------
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverA/task031
+- 本流程直接相关的源码文件：
+    rbac/__main__.py  命令行入口（参数解析、子命令编排、JSON 输出、错误输出）
+    rbac/store.py     SQLite 连接初始化与角色清单的只读查询
+    rbac/policy.py    固定成员-角色配置（仅用于说明清单边界，本流程不调用）
+- 本流程直接相关的已有测试：
+    tests/test_list_roles.py
+- 回归测试（本文写作时已在项目根目录实际执行，非仅纸面声明）：
+    python3 -m unittest discover -s tests
+  实际执行记录：Ran 165 tests ... OK（165 个用例全部通过；当前环境无
+  python 命令，故使用 python3，公开命令本身仍写作 python -m rbac）。
+- 本文第三、五、六节的命令样例均已在项目根目录或临时目录中实际执行，
+  "实际执行记录"部分为真实观察结果；"确定预期"部分为执行前由源码与
+  测试推出的确定预期，两者分开陈述，未执行的验证不写成已通过。
+
+
+一、公开入口与从命令到结果的完整路径
+------------------------------------
+唯一公开入口是命令行：
+
+    python -m rbac --db FILE list-roles
+
+参数注册位置：rbac/__main__.py 的 _build_parser() 中
+subparsers.add_parser("list-roles", ...)（help 文案即"列出当前至少持有
+一条直接授权的全部角色"），该子命令不接收任何位置参数（没有角色、成员
+或权限名称参数）。
+
+一次调用从输入到输出严格按以下顺序执行（编排位置：rbac/__main__.py
+的 main()）：
+
+1. 参数解析与名称校验的跳过
+   argparse 解析 --db 路径与子命令。main() 对 list-roles 取
+   raw_names = ()（空元组，与 export-rules、list-all-permissions 同一
+   段，源码注释"不接收成员、角色或权限参数，无需名称校验"），因此本
+   命令不经过 policy.normalize_name() 的名称规整，也不可能触发
+   invalid_name（退出码 2）分支。
+   核对位置：rbac/__main__.py main() 中 `if args.command in
+   ("export-rules", "list-roles", "list-all-permissions"): raw_names = ()`
+   段。
+
+2. 规则文件准备
+   main() 调用 rbac/store.py 的 connect(db_path)：
+   - sqlite3.connect(db_path) 打开规则文件；父目录存在而文件不存在时，
+     SQLite 会创建新文件；
+   - 随即执行模块常量 _SCHEMA（CREATE TABLE IF NOT EXISTS
+     role_permissions，列为 role、permission，复合主键
+     (role, permission)）并提交，确保授权表结构就绪；
+   - 任何 sqlite3 层面的失败统一包装为 StorageError 抛出。
+   main() 捕获 StorageError 后，经 _fail("storage_error") 向标准错误
+   写入 {"error":"storage_error"} 加一个换行，return 1。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中 `except store.StorageError` 段、_fail()。
+
+3. 只读查询全部角色、去重排序
+   main() 走 `elif args.command == "list-roles":` 分支，调用
+   rbac/store.py 的 list_roles(conn)：
+   - 执行 SELECT role FROM role_permissions（不带 WHERE、不带
+     ORDER BY 的整表只读查询，只取 role 一列）；
+   - 在 Python 侧先经集合去重（同一角色持有多条授权时只保留一个），
+     再用 sorted() 按完整角色名的 Unicode 码点顺序升序排列；
+   - 返回角色名列表；空表返回空列表；
+   - 查询本身的 sqlite3 失败同样包装为 StorageError，由 main() 内层
+     except 输出 storage_error、return 1。
+   核对位置：rbac/store.py list_roles()；rbac/__main__.py main() 中
+   list-roles 分支与内层 `except store.StorageError` 段。
+
+4. JSON 输出
+   main() 把角色名列表组装为 {"roles": [...]}，经 _emit() 以紧凑分隔符
+   （separators=(",", ":")）、ensure_ascii=False 写入标准输出，并追加
+   一个换行，return 0。顶层对象只有 roles 一个字段。
+   核对位置：rbac/__main__.py main() 中 result 组装段、_emit()、
+   _SEPARATORS。
+
+5. 连接关闭
+   无论查询成功还是抛出 StorageError，main() 的 finally 块都会执行
+   conn.close() 关闭数据库连接，再输出结果或错误。
+   核对位置：rbac/__main__.py main() 中 `finally: conn.close()` 段。
+
+
+二、清单内容的语义边界：清单 vs 固定成员关系（核对角色业务权限时必读）
+----------------------------------------------------------------------
+1. 清单只列出库中当前至少持有一条直接授权的角色，即 role_permissions
+   表 role 列的现存值全集。角色是否配置了固定成员不影响结果。
+
+2. 多项权限不会让角色重复出现：表结构以 (role, permission) 为复合主键，
+   list_roles() 再做一次集合去重，同一角色持有多个权限时清单中仍只
+   出现一次。
+   核对位置：tests/test_list_roles.py
+   test_role_with_multiple_permissions_appears_once（reader 持有
+   documents:read 与 documents:write，且重复授予已有配对，清单仍为
+   ["reader"]）。
+
+3. 未绑定成员的角色仍列出。例如角色 ghost 未出现在
+   policy.FIXED_MEMBER_ROLES 中，只要 (ghost, 某权限) 已保存，ghost
+   就会出现在清单中。
+   核对位置：tests/test_list_roles.py
+   test_roles_without_configured_members_are_included。
+
+4. 反向同样成立：绑定了成员的角色若无任何直接授权，不会出现在清单中。
+   固定成员关系 policy.FIXED_MEMBER_ROLES（当前仅 alice -> ("reader",)）
+   只在 check、list-member-permissions 等命令中使用；list-roles 的代码
+   路径不调用 policy.py 的任何函数。因此 alice 绑定 reader 这一事实
+   不保证 reader 出现在清单中——reader 只有在库中确实存有它的直接授权
+   时才会出现。清单回答的是"哪些角色当前持有业务权限"，不是"哪些角色
+   被成员绑定"。
+   核对位置：rbac/__main__.py main() 中 list-roles 分支（仅调用
+   store.list_roles）；rbac/policy.py FIXED_MEMBER_ROLES。
+
+5. 撤销部分权限时角色保留，撤销最后一条授权后角色消失：清单是授权记录
+   的派生视图，角色随第一条授权的出现而出现、随最后一条授权的撤销而
+   消失。这一过程中固定成员关系（policy.FIXED_MEMBER_ROLES）不变——它
+   是源码中的常量，不属于可管理数据，不入库（rbac/store.py 模块
+   docstring 明确说明），grant/revoke 都无法改变它。
+   核对位置：tests/test_list_roles.py
+   test_revoke_keeps_role_until_last_grant_removed（撤销一条权限后角色
+   仍出现，最后一条撤销后从结果消失）；
+   test_acceptance_sample_lists_editor_and_reader（撤销 editor 唯一的
+   授权后清单从 ["editor","reader"] 变为 ["reader"]）。
+
+6. 名称按保存值原样返回，保留保存时的大小写与名称内部空白，不做裁剪、
+   不做大小写折叠；排序按完整角色名的 Unicode 码点升序（大写字母码点
+   小于小写字母，中文等字符按其码点排在 ASCII 之后）。规则不变时重复
+   查询的内容与顺序完全一致。
+   核对位置：rbac/store.py list_roles() docstring；
+   tests/test_list_roles.py
+   test_names_preserved_and_sorted_by_codepoint（"中 文"、"a"、"A"、
+   "reader"、"Reader" 的预期顺序为 A、Reader、a、reader、中 文）；
+   test_repeated_queries_are_stable（两次查询 stdout 逐字节一致）。
+
+
+三、两步示例（命令、确定预期与实际执行记录）
+--------------------------------------------
+前提：在项目根目录执行，rules.db 尚不存在，项目根目录（即规则文件的
+父目录）可写。当前环境用 python3 代替 python，公开命令本身仍写作
+python -m rbac。
+
+第一步，授予 editor 读取权限：
+
+    python -m rbac --db rules.db grant editor documents:read
+
+确定预期：退出码 0；标准错误为空；标准输出恰为下面一行紧凑 JSON 加
+结尾一个换行：
+
+    {"role":"editor","permission":"documents:read"}
+
+第二步，查询当前角色清单：
+
+    python -m rbac --db rules.db list-roles
+
+确定预期：退出码 0；标准错误为空；标准输出恰为下面一行紧凑 JSON 加
+结尾一个换行（UTF-8 编码，除此之外无其他输出）：
+
+    {"roles":["editor"]}
+
+实际执行记录（本文写作时在项目根目录执行，执行前已确认 rules.db 不
+存在；执行后已删除该临时文件，仓库保持干净）：
+- grant 退出码 0，标准输出与上面"确定预期"逐字节一致；
+- list-roles 退出码 0，标准错误为 0 字节，标准输出共 21 字节，即
+  {"roles":["editor"]} 的 20 个 ASCII 字符加结尾一个换行，与"确定
+  预期"逐字节一致。
+
+为何 reader 未列出：固定成员配置中只有 alice -> ("reader",)，但
+list-roles 不读取该配置（见第二节第 4 条）；库中此时只有
+(editor, documents:read) 一条授权，role 列的现存值全集只有 editor，
+故清单只有 editor。alice 绑定 reader 只影响 check 等成员视角的命令，
+不会让 reader 凭空出现在角色清单中。
+
+对应测试：tests/test_list_roles.py
+test_acceptance_sample_lists_editor_and_reader（该用例预置三条授权后
+清单为 ["editor","reader"]，撤销 editor 唯一授权后变为 ["reader"]，
+同样说明清单只反映授权记录的现存状态）。
+
+
+四、查询的只读性
+----------------
+list_roles() 只执行 SELECT，不写入、不删除。规则不变时重复查询结果
+完全一致；既有授权记录与其他表的数据在查询前后保持不变。
+对应测试：tests/test_list_roles.py test_query_is_read_only（查询前后
+比对授权记录，并核对额外建立的 notes 表数据不变）。
+唯一的存储副作用发生在规则文件准备环节（connect() 的建库建表），且
+仅在数据库文件或表尚不存在时发生，见第五节情形 2。
+
+
+五、成功的空结果与两种存储情形的区分
+------------------------------------
+两种情形都返回成功空结果 {"roles":[]}（退出码 0、标准错误为空、标准
+输出为 {"roles":[]} 加换行），但存储情形不同，核对时应当区分：
+
+1. 已有空规则库（文件与授权表已存在，表内无记录）
+   复现方式：先 grant 再 revoke 同一组合造出空库，然后查询。
+       python -m rbac --db empty.db grant reader documents:read
+       python -m rbac --db empty.db revoke reader documents:read
+       python -m rbac --db empty.db list-roles
+   确定预期：退出码 0，标准错误为空，标准输出恰为 {"roles":[]} 加
+   换行。副作用：无——不新建文件，不改动表结构与数据。
+   对应测试：tests/test_list_roles.py
+   test_empty_database_returns_empty_roles。
+
+2. 父目录存在且可写，但规则文件缺失
+       python -m rbac --db new.db list-roles   # new.db 事先不存在
+   确定预期：退出码 0，标准错误为空，标准输出恰为 {"roles":[]} 加
+   换行。副作用：connect() 会创建 new.db 这一可用的 SQLite 规则库
+   文件，并建立 role_permissions 授权表。即"清单为空"不代表"没有
+   触碰存储"。
+   实际执行记录（本文写作时在临时目录执行）：退出码 0，标准输出与
+   预期逐字节一致；查询后 new.db 已存在，内含标准的 role_permissions
+   建表语句（role、permission 两列，复合主键）。
+   对应测试：tests/test_list_roles.py
+   test_missing_db_with_existing_parent_is_created_and_returns_empty
+   （该用例还验证创建出的库可用：授权后再次查询即可看到新角色）。
+
+简言之：情形 1 是纯只读的空结果；情形 2 的空结果伴随"建库建表"副作用。
+两者的 JSON 输出完全相同，只能通过对文件系统的观察区分。
+
+
+六、存储失败与成功空结果的区别（三种失败样例）
+----------------------------------------------
+以下三种情形均不是成功空结果，而是存储失败：
+- 退出码 1；
+- 标准输出为空（0 字节，不输出 {"roles":...} 成功对象，也不输出任何
+  异常堆栈）；
+- 标准错误恰为一行 {"error":"storage_error"} 加一个换行；
+- 不自动修复、不覆盖原文件。
+
+1. 父目录不存在的路径
+       python -m rbac --db no_such_dir/rules.db list-roles
+   sqlite3 无法创建文件，connect() 抛 StorageError。
+   实际执行记录（本文写作时在临时目录执行）：退出码 1，stdout 0 字节，
+   stderr 恰为 {"error":"storage_error"} 加换行；no_such_dir/rules.db
+   未被创建。
+   对应测试：tests/test_list_roles.py
+   test_missing_parent_directory_is_storage_error。
+
+2. 内容不是 SQLite 的既有文件（样例：文本 "this is not a sqlite
+   database"，29 字节）
+   复现方式：把该文本写入 bad.db，然后
+       python -m rbac --db bad.db list-roles
+   connect() 中的建表语句在不合法文件上失败，抛 StorageError。
+   实际执行记录（本文写作时在临时目录执行）：退出码 1，stdout 0 字节，
+   stderr 恰为 {"error":"storage_error"} 加换行；bad.db 仍为原来的
+   29 字节、内容未被修复或覆盖。
+   对应测试：tests/test_list_roles.py
+   test_non_sqlite_file_is_storage_error_and_untouched。
+
+3. role_permissions 表缺少 role 列的既有 SQLite 文件
+   复现方式：用 sqlite3 建库，只建
+   CREATE TABLE role_permissions (permission TEXT NOT NULL) 并插入一行
+   ('documents:read')，然后
+       python -m rbac --db partial.db list-roles
+   connect() 的 CREATE TABLE IF NOT EXISTS 因表已存在而不改动结构；
+   list_roles() 的 SELECT role 因缺列失败，抛 StorageError。
+   实际执行记录（本文写作时在临时目录执行）：退出码 1，stdout 0 字节，
+   stderr 恰为 {"error":"storage_error"} 加换行；查询后表结构仍为单列
+   (permission TEXT NOT NULL)，('documents:read') 一行数据原样保留——
+   查询不会自动补列、不修复结构、不改动既有数据。
+   对应测试：tests/test_list_roles.py
+   test_table_missing_role_column_is_storage_error_and_preserves_data。
+
+与成功空结果的对比要点：{"roles":[]} 只出现在退出码 0、标准错误为空
+的成功路径；只要存储层无法打开或读取规则库，输出就统一是标准错误上的
+{"error":"storage_error"}，标准输出不会有任何内容。核对清单内容与本地
+授权是否一致时，应先确认退出码与标准错误，再比对 JSON。
+
+另外，本命令没有名称位置参数（见第一节），不会触发 invalid_name
+（退出码 2）分支；invalid_name 只可能出现在带名称参数的子命令上。
+
+
+七、验收指引
+------------
+1. 本文每条结论均可对照当前源码核对：流程各环节见第一节标注的文件与
+   函数；语义边界见第二节；对外行为（退出码、标准输出/标准错误内容）
+   见第三、五、六节。
+2. 本文涉及的对外行为全部由 tests/test_list_roles.py 的 12 个用例
+   覆盖，该文件随完整回归套件实际执行通过（165 tests OK，执行记录见
+   "核对基准"）。
+3. 第三、五、六节的命令样例已实际执行，"实际执行记录"为真实观察；
+   "确定预期"为执行前的推导，二者一致。未实际执行的表述本文均已避免。
+4. 本次交付仅新增本文件（docs/当前角色清单流程说明.txt），未修改、
+   新增或删除任何业务代码、测试、README 或数据格式。
+
+交付位置：docs/当前角色清单流程说明.txt（相对于仓库根目录）。
