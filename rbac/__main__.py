@@ -5,6 +5,7 @@
     python -m rbac --db FILE check MEMBER PERMISSION
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-permission-roles PERMISSION
+    python -m rbac --db FILE list-permission-members PERMISSION
     python -m rbac --db FILE list-member-permissions MEMBER
     python -m rbac --db FILE export-rules
 
@@ -70,6 +71,12 @@ def _build_parser():
     )
     permission_roles_parser.add_argument("permission")
 
+    permission_members_parser = subparsers.add_parser(
+        "list-permission-members",
+        help="按直接授权与固定成员关系列出某项权限的获准成员",
+    )
+    permission_members_parser.add_argument("permission")
+
     subparsers.add_parser(
         "export-rules", help="导出库中现存的全部直接角色授权规则"
     )
@@ -93,6 +100,8 @@ def main(argv=None):
     elif args.command == "list-permissions":
         raw_names = (args.role,)
     elif args.command == "list-permission-roles":
+        raw_names = (args.permission,)
+    elif args.command == "list-permission-members":
         raw_names = (args.permission,)
     elif args.command == "list-member-permissions":
         raw_names = (args.member,)
@@ -140,6 +149,11 @@ def main(argv=None):
                 # 单参数子命令：规整后的权限名即 target_name。
                 roles = store.list_roles_for_permission(conn, target_name)
                 result = {"permission": target_name, "roles": roles}
+            elif args.command == "list-permission-members":
+                # 先按直接授权反查角色，再经固定成员关系收敛为获准成员。
+                roles = store.list_roles_for_permission(conn, target_name)
+                members = policy.members_for_permission(roles)
+                result = {"permission": target_name, "members": members}
             elif args.command == "list-member-permissions":
                 roles = policy.roles_for(target_name)
                 permissions = store.list_permissions_for_roles(conn, roles)
