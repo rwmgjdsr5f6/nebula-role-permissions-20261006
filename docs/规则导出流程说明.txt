@@ -1,0 +1,275 @@
+本地角色权限规则库 —— 规则导出流程说明（export-rules）
+====================================================================
+
+文档性质：代码理解交付物（纯文本说明）。本文只描述当前源码的真实状态，
+所有示例、分支与存储边界均可对照当前源码逐一核对。本次交付仅新增本文件，
+不修改任何业务代码、测试、README、SQLite 数据格式，也不改变任何公开命令
+（python -m rbac 各子命令）的现有行为、JSON 字段或输出形态。本文不描述
+成员管理、角色继承等源码中不存在的能力。
+
+导出内容的口径（先明确，避免误用）
+----------------------------------
+export-rules 导出的是规则库中现存的"角色 -> 权限"直接授权组合本身，
+即 role_permissions 表的内容。请特别注意三点：
+
+1. 导出的是授权组合，不是成员有效权限清单。它不经过任何成员-角色换算，
+   要核对"某成员实际拥有哪些权限"应使用 list-member-permissions，
+   而不是本命令。
+2. 没有绑定任何固定成员的角色（例如未出现在 policy.FIXED_MEMBER_ROLES
+   任何值中的角色）只要库里有授权，照样出现在导出结果中。
+3. 导出结果不包含固定成员与角色的对应关系。该对应关系是
+   rbac/policy.py 中的固定内存配置 FIXED_MEMBER_ROLES（当前仅
+   alice -> reader），不入库、不在导出字段中，也无法由任何命令改动。
+
+因此，用本导出核对"本地保存的直接角色授权"是否一致是合适的；用它推断
+成员权限则不合适。
+
+
+核对基准
+--------
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverB/task018
+- 本流程直接相关的源码文件：
+    rbac/__main__.py  命令行入口（参数解析、调用编排、输出）
+    rbac/store.py     SQLite 连接初始化与全部授权规则的只读导出
+    rbac/policy.py    固定成员-角色配置（本命令不读取，仅作口径对照）
+- 本流程直接相关的已有测试：
+    tests/test_export_rules.py（export-rules 的全部回归测试均在此文件）
+- 回归测试（本文写作时已在项目根目录实际执行，非仅纸面声明）：
+    python3 -m unittest discover -s tests
+  结果：Ran 104 tests ... OK（104 个用例全部通过；当前环境无 python
+  命令，故使用 python3，公开命令本身仍写作 python -m rbac）。
+
+
+一、公开入口与按调用顺序的各环节
+--------------------------------
+唯一公开入口是命令行：
+
+    python -m rbac --db FILE export-rules
+
+参数注册位置：rbac/__main__.py 的 _build_parser() 中
+subparsers.add_parser("export-rules", ...)（无任何位置参数）；命令
+docstring 为"导出库中现存的全部直接角色授权规则"。
+
+一次调用从输入到输出严格按以下顺序执行（编排位置：rbac/__main__.py
+的 main()）。
+
+1. 名称校验（对本命令为空操作）
+   main() 对 export-rules 取 raw_names = ()（源码注释："不接收成员、
+   角色或权限参数，无需名称校验"），规整列表为空，不可能触发
+   invalid_name 分支。即本命令没有退出码 2 的路径。
+
+2. 规则库准备
+   main() 调用 rbac/store.py 的 connect(db_path)：
+   - sqlite3.connect(db_path) 打开规则文件；父目录存在而文件不存在时，
+     SQLite 会创建新文件；
+   - 随即执行模块常量 _SCHEMA：
+       CREATE TABLE IF NOT EXISTS role_permissions (
+           role       TEXT NOT NULL,
+           permission TEXT NOT NULL,
+           PRIMARY KEY (role, permission)
+       )
+     并 commit。对结构正确的已有表，IF NOT EXISTS 为空操作；对结构
+     不兼容的已有表（如缺 permission 列），此语句同样为空操作，不会
+     补列、不会报错；
+   - 连接建立或建表初始化中的任何 sqlite3.Error 统一包装为
+     StorageError；建表阶段失败时 connect 内部先关闭连接再抛出。
+   main() 在 connect 处捕获 StorageError：标准错误写入
+   {"error":"storage_error"} 加一个换行，return 1。
+   核对位置：rbac/store.py connect()、_SCHEMA、StorageError；
+   rbac/__main__.py main() 中第一层 try/except store.StorageError。
+
+3. 全部规则读取（只读）
+   连接就绪后，main() 的 if args.command == "export-rules" 分支调用
+   rbac/store.py 的 list_all_rules(conn)：
+   - 执行 SELECT role, permission FROM role_permissions（不带 WHERE，
+     不做任何成员、通配或大小写处理）；
+   - 结果先经集合去重：同一（角色, 权限）组合只出现一次（表的主键
+     本就保证组合唯一，这里的集合去重是双保险）；
+   - 再用 Python sorted() 对 (role, permission) 元组排序：先按完整
+     角色名的 Unicode 码点顺序升序，角色相同时再按完整权限名同样
+     排序；
+   - 名称按库里保存值原样返回，保留大小写与内部空白，不再裁剪；
+     "*"、"%"、"_" 均为普通字符，不做模式匹配；
+   - 空表返回空列表。
+   查询中的 sqlite3.Error 包装为 StorageError，由 main() 内层
+   except 输出 {"error":"storage_error"} 并 return 1；无论成功失败，
+   finally 中都执行 conn.close()。
+   核对位置：rbac/store.py list_all_rules()。
+
+4. 结果组装与输出
+   成功时 main() 组装结果对象，顶层恰有一个键 rules，每条规则恰有
+   role 和 permission 两个字段、无多余字段：
+       {"rules": [{"role": ..., "permission": ...}, ...]}
+   经 _emit() 写入标准输出：json.dumps(obj, ensure_ascii=False,
+   separators=(",", ":"))（紧凑 UTF-8 JSON，键值间与元素间无空白，
+   非 ASCII 字符不转义）后追加恰好一个换行；return 0，标准错误为空。
+   main() 开头把 stdout/stderr reconfigure 为 UTF-8，保证中文等字符
+   在任何区域配置下按 UTF-8 输出。
+   核对位置：rbac/__main__.py main() 的 export-rules 分支、_emit()、
+   _fail()、_SEPARATORS。
+
+
+二、固定样例核对（主路径，已实际执行）
+--------------------------------------
+前提：父目录存在，rules.db 中已保存三条直接授权——reader 的
+documents:read、reader 的 documents:write、editor 的 documents:read
+（例如先经三条 python -m rbac --db rules.db grant ... 写入；重复
+grant 同一组合按幂等成功处理，不产生重复行）。
+
+命令：
+
+    python -m rbac --db rules.db export-rules
+
+预期（与源码推导一致）：
+- 退出码 0；
+- 标准错误为空；
+- 标准输出恰为一个紧凑 JSON 对象加一个换行：
+
+    {"rules":[{"role":"editor","permission":"documents:read"},{"role":"reader","permission":"documents:read"},{"role":"reader","permission":"documents:write"}]}
+
+- rules 数组依次为 editor 的读权限、reader 的读权限、reader 的写权限；
+  每项只有 role 和 permission 两个字段。
+
+顺序解释：先按角色完整名称的 Unicode 码点升序，"editor" 与 "reader"
+在首字符处比较 'e'(0x65) < 'r'(0x72)，故 editor 在前；角色同为
+reader 时按权限完整名称排序，"documents:read" 与 "documents:write"
+在第 11 个字符处比较 'r'(0x72) < 'w'(0x77)，故 read 在 write 前。
+
+实际执行记录（本文写作时在本机临时目录实际执行，非仅预期）：
+- 三条 grant 依次返回 {"role":"reader","permission":"documents:read"}、
+  {"role":"reader","permission":"documents:write"}、
+  {"role":"editor","permission":"documents:read"}；
+- 导出退出码 0，标准错误 0 字节，标准输出与上面预期逐字节一致；
+- 紧接再次执行同一导出，两次输出文件逐字节相同（重复导出结果一致）；
+- 导出后直接读 SQLite，role_permissions 表内容仍为排序后的
+  [('editor','documents:read'), ('reader','documents:read'),
+  ('reader','documents:write')]，未被导出改动。
+
+对应测试（tests/test_export_rules.py）：
+  test_export_matches_acceptance_sample
+    （验收样例：三条授权按上述顺序导出；顶层仅 rules 键；每条仅
+    role/permission 两字段）
+  test_export_after_duplicate_grant_still_unique_and_stable
+    （重复授予已有配对后导出仍只有三条；规则不变时重复导出内容一致）
+
+排序、去重与名称保留的通用口径（样例之外的同类核对）：
+- 同一（角色, 权限）组合无论授予几次，导出中只出现一次；
+- 排序依据是完整字符串的 Unicode 码点，而非写入顺序或本地化字母序；
+- 名称保留保存值的大小写与空白，星号、百分号、下划线都是普通字符。
+对应测试：
+  test_export_sorts_by_codepoint_and_preserves_names
+    （预置 "A"/"a"/"b"/"Reader"/"reader"/"中" 与
+    "documents:*"/"documents:%"/"documents:_" 等授权，导出顺序固定为
+    A/a、A/b、Reader/documents:read、b/中、reader/documents:%、
+    reader/documents:*、reader/documents:_，即严格码点升序且通配符
+    原样输出）
+  test_export_includes_roles_without_members
+    （未关联任何固定成员的角色 ghost 及其授权 ghost:only 同样导出，
+    排在 reader 之前）
+
+只读性：导出本身不写入、不删除任何授权，也不触碰其他表。
+对应测试：
+  test_export_is_read_only
+    （导出前后授权记录一致；另建的 notes 表数据保持不变）
+
+
+三、空结果与两种"空库"的存储副作用区分
+--------------------------------------
+export-rules 对空结果一律返回 {"rules":[]}（退出码 0，标准错误为空，
+标准输出为该紧凑 JSON 加一个换行），但"空"的来源有两种，存储副作用
+不同，必须区分：
+
+1. 已有空规则库：文件已存在、表结构正确、表中无授权行（例如 grant 后
+   又 revoke 掉唯一一条）。导出只读，不改动文件；返回 {"rules":[]}。
+   对应测试：test_export_on_empty_database_returns_empty_rules。
+
+2. 父目录存在但规则文件缺失：connect() 会创建该文件并执行建表语句，
+   即导出沿用建库行为，副作用是"新建一个含空 role_permissions 表的
+   可用 SQLite 规则库"，随后照常返回 {"rules":[]}。新建的库可直接
+   用于后续 grant/查询。
+   对应测试：test_export_on_missing_db_initializes_and_returns_empty。
+
+实际执行记录（本文写作时实际执行）：
+- 对已有空库（grant 后 revoke）导出，输出 {"rules":[]}，退出码 0；
+- 对父目录存在但缺失的 sub/new.db 导出，输出 {"rules":[]}，退出码 0，
+  执行后该文件被创建（12288 字节的 SQLite 库）。
+
+即：两种情形对调用方的输出完全相同，区别只在第二种会在磁盘上留下
+新建的可用规则库文件；第一种不产生任何存储变化。
+
+
+四、存储失败与成功空结果的区别（边界逐条可核对）
+------------------------------------------------
+以下三类输入一律得到存储失败：退出码 1；标准输出为空（不输出成功
+对象、不夹带 rules 字段）；标准错误恰为 {"error":"storage_error"}
+加一个换行，不输出异常堆栈或错误详情。它们与上一节的成功空结果
+{"rules":[]} 通过退出码与输出通道即可明确区分。
+
+1. 父目录不存在的 --db 路径
+   sqlite3.connect 无法在不存在的目录中创建文件，connect() 包装为
+   StorageError。不创建任何文件或目录。
+   对应测试：test_export_missing_parent_directory_is_storage_error。
+   实际执行记录：python -m rbac --db nope/x.db export-rules 退出码 1，
+   标准输出为空，标准错误恰为 {"error":"storage_error"} 加换行，
+   目录 nope 未被创建。
+
+2. 内容为连续 128 个 ASCII 字符 x 的文件
+   文件存在但不是 SQLite 数据库。sqlite3.connect 可以建立连接，但
+   connect() 内的建表初始化（CREATE TABLE IF NOT EXISTS）必然失败并
+   包装为 StorageError，失败发生在规则库准备阶段。调用前后文件字节
+   完全相同（仍是那 128 个 x）：不清空、不覆盖、不截断、不修补。
+   对应测试：test_export_non_sqlite_file_is_storage_error_and_untouched。
+   实际执行记录：对 printf 生成的 128 字节 bad.db 导出，退出码 1，
+   标准输出为空，标准错误恰为 {"error":"storage_error"} 加换行；
+   执行后文件仍为 128 字节、开头仍是 x。
+
+3. role_permissions 表只有 role 列的 SQLite 文件
+   文件是可正常打开的 SQLite 数据库，其中 role_permissions 表只有
+   role 列并存有一行 reader。CREATE TABLE IF NOT EXISTS 对已有表为
+   空操作，连接准备阶段不报错、不补列；差异发生在规则读取阶段：
+   list_all_rules 的 SELECT role, permission 因缺 permission 列抛出
+   sqlite3.Error，包装为 StorageError。失败后表结构仍只有 role 列，
+   reader 行保持不变，不自动补列、不改动既有数据。
+   对应测试：test_export_table_missing_permission_column_is_storage_error。
+   实际执行记录：对预置的 nocol.db 导出，退出码 1，标准输出为空，
+   标准错误恰为 {"error":"storage_error"} 加换行；执行后表仍只有
+   role 列、数据仍为 [('reader',)]。
+
+三类失败的共同输出约定：退出码 1；标准输出为空；标准错误恰为
+{"error":"storage_error"} 加一个换行。后两类保留原文件内容或既有
+结构与数据，不做任何修复性写入。
+
+
+五、存储边界小结
+----------------
+- 入库的只有"角色 -> 权限"直接授权规则（role_permissions 表）；
+  FIXED_MEMBER_ROLES（当前仅 alice -> reader）是 rbac/policy.py 中的
+  固定内存配置，不入库、不出现在导出结果中。
+- export-rules 的规则读取是只读的：不写入、不删除授权，不触碰其他表；
+  但它与其他子命令共用 connect()，在文件缺失且父目录存在时会创建文件
+  并建表（第三节第 2 条），这是本命令唯一的存储副作用。
+- 调用次序决定边界行为：本命令无名称参数，跳过名称校验；规则库准备
+  （connect/建表，可能退出码 1）先于规则读取（缺列等结构问题在此阶段
+  才暴露，同样退出码 1）。
+- 不存在登录、角色继承、通配权限或成员管理；"*"、"%"、"_" 等在名称
+  匹配中均为普通字符，本文不将规划方向描述为已实现能力。
+
+
+六、验收口径
+------------
+1. 以源码为准：流程各环节见第一节标注的文件与函数；对外行为（退出码、
+   stdout/stderr 字节形态）见第二、三、四节。
+2. 以示例预期与源码一致为验收口径：第二节固定样例（reader 读/写与
+   editor 读）可手工执行复现，预期输出已逐字给出；本文写作时已在本机
+   实际执行核对，输出与预期一致，实际执行记录已在各节中与预期分开
+   标注。
+3. 已有测试是场景化核对清单：tests/test_export_rules.py 覆盖本文描述
+   的全部对外行为（验收样例、重复授予去重、重复导出一致、空库与缺失
+   文件、无成员角色、码点排序与名称保留、只读性、三类存储失败），各节
+   已标注对应用例名。本次交付时已实际执行
+   python3 -m unittest discover -s tests，104 个用例全部通过；本文
+   不把任何未执行的检查表述为"已通过"。
+4. 本次交付仅新增本文件（docs/规则导出流程说明.txt），未修改、新增或
+   删除任何业务代码、测试、README、SQLite 数据格式或公开命令行为。
+
+交付位置：docs/规则导出流程说明.txt（相对于仓库根目录）。
