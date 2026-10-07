@@ -30,6 +30,23 @@ def roles_for(member):
     return list(roles) if roles is not None else []
 
 
+def members_for_role(role):
+    """按角色名反查固定关联成员；纯内存计算，不访问存储。
+
+    角色按完整名称大小写敏感精确匹配（调用方应先经 normalize_name
+    规整）；返回成员名字符串数组，成员名按固定配置原值保留，去重后
+    按完整名称的 Unicode 码点顺序升序排列；没有成员绑定该角色时
+    返回空列表。结果只取决于固定成员关系，与规则库中的授权无关。
+    """
+    return sorted(
+        {
+            member
+            for member, roles in FIXED_MEMBER_ROLES.items()
+            if role in roles
+        }
+    )
+
+
 def members_for_permission(granted_roles):
     """按直接获授角色与固定成员关系反查获准成员；纯内存计算，不访问存储。
 

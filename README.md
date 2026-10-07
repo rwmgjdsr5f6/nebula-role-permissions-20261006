@@ -50,6 +50,19 @@ $ python -m rbac --db rules.db check bob documents:read
 
 `check` 等查询命令不改动任何授权记录；但如果规则文件尚不存在且父目录可写，首次调用（包括查询）仍会创建该文件。
 
+## 按角色查询固定成员
+
+`list-role-members` 直接查看某角色当前固定关联的合成成员，结果只取决于源码中的固定成员关系，与库中的授权无关：
+
+```console
+$ python -m rbac --db rules.db list-role-members reader
+{"role":"reader","members":["alice"]}
+$ python -m rbac --db rules.db list-role-members editor
+{"role":"editor","members":[]}
+```
+
+`editor` 未绑定任何固定成员，空数组是正常空结果（退出码 0），不是执行失败；`Reader` 不会匹配 `reader`。成员名保留配置原值，去重后按完整名称的 Unicode 码点升序排列。
+
 ## 名称规则
 
 所有成员名、角色名、权限名先去除首尾空白，再按完整字符串做**大小写敏感**的精确匹配。
@@ -70,6 +83,7 @@ python -m rbac --db FILE check MEMBER PERMISSION
 python -m rbac --db FILE list-permissions ROLE
 python -m rbac --db FILE list-permission-roles PERMISSION
 python -m rbac --db FILE list-permission-members PERMISSION
+python -m rbac --db FILE list-role-members ROLE
 python -m rbac --db FILE list-member-permissions MEMBER
 python -m rbac --db FILE list-roles
 python -m rbac --db FILE list-all-permissions

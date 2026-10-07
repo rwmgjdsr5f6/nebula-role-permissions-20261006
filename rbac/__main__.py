@@ -6,6 +6,7 @@
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-permission-members PERMISSION
+    python -m rbac --db FILE list-role-members ROLE
     python -m rbac --db FILE list-member-permissions MEMBER
     python -m rbac --db FILE list-roles
     python -m rbac --db FILE list-all-permissions
@@ -79,6 +80,12 @@ def _build_parser():
     )
     permission_members_parser.add_argument("permission")
 
+    role_members_parser = subparsers.add_parser(
+        "list-role-members",
+        help="按固定成员关系列出直接绑定某角色的全部合成成员",
+    )
+    role_members_parser.add_argument("role")
+
     subparsers.add_parser(
         "list-roles", help="列出当前至少持有一条直接授权的全部角色"
     )
@@ -112,6 +119,8 @@ def main(argv=None):
         raw_names = (args.permission,)
     elif args.command == "list-permission-members":
         raw_names = (args.permission,)
+    elif args.command == "list-role-members":
+        raw_names = (args.role,)
     elif args.command == "list-member-permissions":
         raw_names = (args.member,)
     else:
@@ -167,6 +176,11 @@ def main(argv=None):
                 roles = store.list_roles_for_permission(conn, target_name)
                 members = policy.members_for_permission(roles)
                 result = {"permission": target_name, "members": members}
+            elif args.command == "list-role-members":
+                # 结果只取决于固定成员关系；连接仍按既有行为打开并初始化
+                # （文件缺失且父目录可写时创建空库），但不查询任何授权。
+                members = policy.members_for_role(target_name)
+                result = {"role": target_name, "members": members}
             elif args.command == "list-member-permissions":
                 roles = policy.roles_for(target_name)
                 permissions = store.list_permissions_for_roles(conn, roles)
