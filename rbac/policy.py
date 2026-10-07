@@ -30,6 +30,25 @@ def roles_for(member):
     return list(roles) if roles is not None else []
 
 
+def members_for_permission(granted_roles):
+    """按固定成员关系反查直接获授某权限的成员。
+
+    granted_roles 为直接获授该权限的角色名集合。返回成员项列表，每项含
+    member 及该成员直接获授该权限的 roles（去重后按 Unicode 码点升序）；
+    成员按名称码点升序排列，不重复。未绑定任何固定成员的角色不产生成员项；
+    没有成员命中时返回空列表。
+    """
+    granted = set(granted_roles)
+    members = []
+    for member in sorted(FIXED_MEMBER_ROLES):
+        roles = sorted(
+            {role for role in FIXED_MEMBER_ROLES[member] if role in granted}
+        )
+        if roles:
+            members.append({"member": member, "roles": roles})
+    return members
+
+
 def decide(member, permission, granted):
     """依据成员角色与规则匹配结果生成决定。
 
