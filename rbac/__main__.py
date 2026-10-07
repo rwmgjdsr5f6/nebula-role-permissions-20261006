@@ -8,6 +8,7 @@
     python -m rbac --db FILE list-permission-members PERMISSION
     python -m rbac --db FILE list-member-permissions MEMBER
     python -m rbac --db FILE list-roles
+    python -m rbac --db FILE list-all-permissions
     python -m rbac --db FILE export-rules
 
 退出码约定：
@@ -82,6 +83,10 @@ def _build_parser():
         "list-roles", help="列出当前至少持有一条直接授权的全部角色"
     )
     subparsers.add_parser(
+        "list-all-permissions",
+        help="列出当前至少被一个角色直接获授的全部权限名",
+    )
+    subparsers.add_parser(
         "export-rules", help="导出库中现存的全部直接角色授权规则"
     )
     return parser
@@ -96,7 +101,7 @@ def main(argv=None):
 
     args = _build_parser().parse_args(argv)
 
-    if args.command in ("export-rules", "list-roles"):
+    if args.command in ("export-rules", "list-roles", "list-all-permissions"):
         # 不接收成员、角色或权限参数，无需名称校验。
         raw_names = ()
     elif args.command in ("grant", "revoke"):
@@ -138,6 +143,8 @@ def main(argv=None):
                 }
             elif args.command == "list-roles":
                 result = {"roles": store.list_roles(conn)}
+            elif args.command == "list-all-permissions":
+                result = {"permissions": store.list_all_permissions(conn)}
             elif args.command == "grant":
                 store.grant_permission(conn, target_name, permission)
                 result = {"role": target_name, "permission": permission}
