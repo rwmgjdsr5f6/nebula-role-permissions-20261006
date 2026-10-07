@@ -38,14 +38,27 @@ def connect(db_path):
 
 
 def grant_permission(conn, role, permission):
-    """授予角色权限；规则已存在时不产生重复行（INSERT OR IGNORE）。"""
+    """授予角色权限；规则已存在时幂等成功，否则必须实际写入一行。
+
+    先查询（角色, 权限）组合：已存在则直接返回，不产生重复行。
+    不存在时用普通 INSERT 写入；既有表上的唯一约束或检查约束阻止
+    新增规则时，sqlite3 抛出的异常统一包装为 StorageError，由调用方
+    按存储失败处理，已有授权、其他表与表结构保持不变。
+    """
     try:
+        row = conn.execute(
+            "SELECT 1 FROM role_permissions WHERE role = ? AND permission = ?",
+            (role, permission),
+        ).fetchone()
+        if row is not None:
+            return
         conn.execute(
-            "INSERT OR IGNORE INTO role_permissions (role, permission) VALUES (?, ?)",
+            "INSERT INTO role_permissions (role, permission) VALUES (?, ?)",
             (role, permission),
         )
         conn.commit()
     except sqlite3.Error as exc:
+        conn.rollback()
         raise StorageError(str(exc)) from exc
 
 
