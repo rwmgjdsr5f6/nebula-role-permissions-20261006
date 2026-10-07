@@ -64,8 +64,12 @@ README.md 第 5 行仍写着"当前仓库仅包含项目说明，业务功能尚
    rbac/__main__.py main() 中 try/except store.StorageError 段。
 
 4. 直接角色匹配
-   - grant：store.grant_permission() 以 INSERT OR IGNORE 写入
-     （角色， 权限）规则；规则已存在时不产生重复行。
+   - grant：store.grant_permission() 先按规整后的（角色, 权限）组合做
+     精确查询：组合已存在时按幂等成功直接返回；组合不存在时执行普通
+     INSERT 并提交，再复查该组合确实可被读出。规则已存在时不产生重复
+     行；既有表的唯一约束或检查约束阻止新增时，普通 INSERT 抛出的
+     sqlite3 失败统一包装为 StorageError（不再用 INSERT OR IGNORE 吞掉
+     约束拒绝）。
    - check：policy.roles_for(member) 从固定配置 FIXED_MEMBER_ROLES
      取出成员的直接角色列表（当前仅 alice -> ("reader",)，未配置成员
      得到空列表），store.permission_granted() 只读查询这些角色中是否
@@ -132,9 +136,9 @@ README.md 第 5 行仍写着"当前仓库仅包含项目说明，业务功能尚
 5) 持久化与幂等：
    - 每次调用都重新打开同一数据库文件；重新打开 rules.db 后再次执行
      第 2 步的 check，输出与之前完全一致，授权记录仍然保留。
-   - 重复执行第 1 步的 grant，因 INSERT OR IGNORE 与 (role, permission)
-     主键约束，role_permissions 表中仍只有一条 (reader, documents:read)
-     记录，不增加规则记录。
+   - 重复执行第 1 步的 grant，因规整后的 (role, permission) 组合已存在、
+     写入前的精确查询即按幂等成功处理，role_permissions 表中仍只有一条
+     (reader, documents:read) 记录，不增加规则记录。
 
 
 三、名称与存储边界（逐条可核对）
@@ -174,7 +178,22 @@ README.md 第 5 行仍写着"当前仓库仅包含项目说明，业务功能尚
    核对位置：rbac/__main__.py main() 中名称校验先于 store.connect()
    的执行顺序；tests 中 test_invalid_name_takes_precedence_over_storage_error。
 
-5. 固定成员关系与数据边界
+5. 既有表约束阻止 grant 写入
+   规则文件中的 role_permissions 可能带与标准结构（复合主键）不同的
+   既有约束，例如 role TEXT NOT NULL UNIQUE 的单列唯一约束，或
+   permission 列上的 CHECK(permission <> 'documents:write') 检查约束。
+   grant 的幂等性只看规整后的（角色, 权限）组合是否已存在：
+   - 组合已存在：按幂等成功处理，退出码 0，返回现有 role、permission
+     JSON，标准错误为空，不增加记录；
+   - 组合不存在但被唯一约束或检查约束阻止新增：退出码 1，标准输出为空，
+     标准错误恰为一行 {"error":"storage_error"} 加一个换行；原有授权、
+     其他表与既有表结构保持不变。
+   修复前 grant 用 INSERT OR IGNORE，会把约束拒绝一并吞掉而在规则并未
+   写入时仍报告成功；现改为写入前精确查询 + 普通 INSERT + 提交后复查，
+   只有目标规则实际持久保存才算成功。
+   核对位置：rbac/store.py grant_permission()；tests/test_grant_constraint.py。
+
+6. 固定成员关系与数据边界
    - alice 与 reader 的对应关系来自 rbac/policy.py 中的固定配置
      FIXED_MEMBER_ROLES，不来自数据库；数据库只保存"角色 -> 权限"
      规则（rbac/store.py 模块 docstring 明确说明成员-角色对应不入库）。

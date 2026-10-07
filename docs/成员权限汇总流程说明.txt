@@ -116,8 +116,8 @@ rbac/__main__.py 的 main()）。
 前提：父目录存在，rules.db 中已存在 reader 的两条直接授权
 documents:read、documents:write（例如先经
 python -m rbac --db rules.db grant reader documents:read 与
-... grant reader documents:write 写入；重复 grant 因 INSERT OR IGNORE
-与主键 (role, permission) 不产生重复行）。
+... grant reader documents:write 写入；重复 grant 因规整后的
+(role, permission) 组合已存在而按幂等成功处理，不产生重复行）。
 
 1) 查询 alice：
 

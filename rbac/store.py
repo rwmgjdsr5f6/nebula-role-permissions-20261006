@@ -38,15 +38,46 @@ def connect(db_path):
 
 
 def grant_permission(conn, role, permission):
-    """授予角色权限；规则已存在时不产生重复行（INSERT OR IGNORE）。"""
+    """授予角色权限；返回规则是否为本次实际新增。
+
+    幂等性以“规整后的（角色, 权限）组合是否已存在”为准，而非依赖
+    INSERT OR IGNORE：既有表可能带有与标准结构不同的唯一约束或检查约束，
+    INSERT OR IGNORE 会把这类约束拒绝一并吞掉，在规则并未写入时仍报告
+    成功。因此这里先做精确查询——组合已存在时按幂等成功直接返回；
+    组合不存在时执行普通 INSERT 并提交，再复查该组合确实可被读出。
+    只有目标规则实际持久保存才算成功；任何 sqlite3 失败（含唯一约束、
+    检查约束阻止写入）或写入未生效都包装为 StorageError，原有授权、
+    其他表与既有表结构保持不变。
+    """
     try:
-        conn.execute(
-            "INSERT OR IGNORE INTO role_permissions (role, permission) VALUES (?, ?)",
+        existed = conn.execute(
+            "SELECT 1 FROM role_permissions "
+            "WHERE role = ? AND permission = ? LIMIT 1",
+            (role, permission),
+        ).fetchone()
+        if existed is not None:
+            return False
+        cursor = conn.execute(
+            "INSERT INTO role_permissions (role, permission) VALUES (?, ?)",
             (role, permission),
         )
         conn.commit()
+        persisted = conn.execute(
+            "SELECT 1 FROM role_permissions "
+            "WHERE role = ? AND permission = ? LIMIT 1",
+            (role, permission),
+        ).fetchone()
     except sqlite3.Error as exc:
+        # 约束拒绝或其他读写失败：丢弃未提交的部分写入，统一按存储失败上报。
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
         raise StorageError(str(exc)) from exc
+    if cursor.rowcount != 1 or persisted is None:
+        # 普通 INSERT 成功提交后必然新增一行且可复查到；否则视为未持久保存。
+        raise StorageError("grant did not persist the rule")
+    return True
 
 
 def revoke_permission(conn, role, permission):
