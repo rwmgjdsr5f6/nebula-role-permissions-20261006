@@ -190,10 +190,15 @@ def main(argv=None):
                     "permissions": permissions,
                 }
             else:
-                granted = store.permission_granted(
-                    conn, policy.roles_for(target_name), permission
+                # 成员角色只解析一次：同一份 roles 既用于直接授权匹配，
+                # 又原样作为决定中的角色说明，避免两处分别调用 roles_for
+                # 造成角色处理重复与不一致。空角色（如 bob）时
+                # permission_granted 不读取授权表，直接返回 False。
+                roles = policy.roles_for(target_name)
+                granted = store.permission_granted(conn, roles, permission)
+                result = policy.decide_with_roles(
+                    target_name, permission, roles, granted
                 )
-                result = policy.decide(target_name, permission, granted)
         except store.StorageError:
             _fail("storage_error")
             return 1

@@ -67,12 +67,15 @@ def members_for_permission(granted_roles):
     ]
 
 
-def decide(member, permission, granted):
-    """依据成员角色与规则匹配结果生成决定。
+def decide_with_roles(member, permission, roles, granted):
+    """依据已解析的成员角色与规则匹配结果组装决定；纯内存计算。
 
-    granted 表示该成员的任一直接角色是否直接拥有请求的权限。
+    roles 为调用方一次性解析出的成员全部直接角色（保留顺序与重复项）：
+    同一份角色既作为授权匹配的入参，又原样充当决定中的角色说明，避免
+    授权判断与结果角色分别解析造成不一致。结果中的 roles 是入参列表的
+    副本，调用方修改入参或返回列表都不影响固定配置或后续结果。
+    granted 表示这些角色中是否有任一个直接拥有请求的权限。
     """
-    roles = roles_for(member)
     if not roles:
         allowed = False
         reason = REASON_MEMBER_NOT_CONFIGURED
@@ -86,7 +89,17 @@ def decide(member, permission, granted):
     return {
         "member": member,
         "permission": permission,
-        "roles": roles,
+        "roles": list(roles),
         "allowed": allowed,
         "reason": reason,
     }
+
+
+def decide(member, permission, granted):
+    """依据成员角色与规则匹配结果生成决定。
+
+    granted 表示该成员的任一直接角色是否直接拥有请求的权限。本函数面向
+    直接调用：自行经 roles_for 解析固定角色后交给 decide_with_roles，
+    纯内存计算，不访问存储；角色解析只发生一次。
+    """
+    return decide_with_roles(member, permission, roles_for(member), granted)
