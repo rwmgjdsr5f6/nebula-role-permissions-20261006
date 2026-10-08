@@ -192,6 +192,25 @@ def list_all_rules(conn):
     return sorted({(row[0], row[1]) for row in rows})
 
 
+def list_rules_for_role(conn, role):
+    """导出指定角色当前保存的全部直接授权规则；本函数只执行只读查询。
+
+    角色按完整名称大小写敏感精确匹配（"*"、"%"、"_" 均为普通字符）；
+    同一（角色, 权限）组合只出现一次，先按完整角色名（本查询至多一个）
+    再按完整权限名的 Unicode 码点顺序升序排列，名称按保存值原样返回。
+    角色从未出现或其授权已全部撤销时返回空列表；角色是否配置了固定
+    成员不影响结果。返回 (role, permission) 元组列表。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT role, permission FROM role_permissions WHERE role = ?",
+            (role,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({(row[0], row[1]) for row in rows})
+
+
 def list_all_permissions(conn):
     """列出库中当前至少被一个角色直接获授的全部权限名；只读查询。
 

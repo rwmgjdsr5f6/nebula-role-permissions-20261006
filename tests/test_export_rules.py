@@ -31,6 +31,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERMISSION_READ = "documents:read"
 PERMISSION_WRITE = "documents:write"
 STORAGE_ERROR = '{"error":"storage_error"}\n'
+INVALID_NAME_ERROR = '{"error":"invalid_name"}\n'
 
 
 class ExportRulesTests(unittest.TestCase):
@@ -73,8 +74,11 @@ class ExportRulesTests(unittest.TestCase):
     def grant(self, role, permission, **kwargs):
         return self.run_rbac("grant", role, permission, **kwargs)
 
-    def export_rules(self, **kwargs):
-        return self.run_rbac("export-rules", **kwargs)
+    def export_rules(self, role=None, **kwargs):
+        argv = ("export-rules",)
+        if role is not None:
+            argv += ("--role", role)
+        return self.run_rbac(*argv, **kwargs)
 
     def assert_success_json(self, proc, context):
         """成功调用：退出码 0、标准错误为空、标准输出为单个 JSON 对象加换行。"""
@@ -362,6 +366,239 @@ class ExportRulesTests(unittest.TestCase):
             rows_after,
             f"导出失败不应改动已有数据，之前 {rows_before!r}，之后 {rows_after!r}",
         )
+
+    # ---- --role 按角色筛选 ----------------------------------------------
+
+    def test_export_role_matches_acceptance_sample(self):
+        # 指定 reader：只得到 reader 的两条规则（read 在 write 之前），
+        # editor 的授权不出现；每项仍只有 role 和 permission 两个字段。
+        self.grant_acceptance_sample()
+
+        result = self.assert_success_json(
+            self.export_rules(role="reader"), "按 reader 筛选导出"
+        )
+        self.assertEqual(
+            result,
+            {
+                "rules": [
+                    {"role": "reader", "permission": PERMISSION_READ},
+                    {"role": "reader", "permission": PERMISSION_WRITE},
+                ]
+            },
+            f"--role reader 应只含 reader 的两条规则，实际为 {result!r}",
+        )
+        for entry in result["rules"]:
+            self.assertEqual(set(entry.keys()), {"role", "permission"})
+
+    def test_export_role_is_stable_and_repeatable(self):
+        self.grant_acceptance_sample()
+        first = self.assert_success_json(
+            self.export_rules(role="reader"), "首次按角色导出"
+        )
+        second = self.assert_success_json(
+            self.export_rules(role="reader"), "再次按角色导出"
+        )
+        self.assertEqual(first, second, "规则不变时重复导出应一致")
+
+    def test_export_role_trims_surrounding_whitespace_but_matches_case_sensitive(self):
+        # 首尾空白先去除再精确匹配；内部空白保留；匹配大小写敏感。
+        self.grant_acceptance_sample()
+        trimmed = self.assert_success_json(
+            self.export_rules(role="  reader\t"), "带首尾空白的角色名"
+        )
+        self.assertEqual(
+            [entry["role"] for entry in trimmed["rules"]],
+            ["reader", "reader"],
+            f"首尾空白应被去除后匹配 reader，实际为 {trimmed!r}",
+        )
+        wrong_case = self.assert_success_json(
+            self.export_rules(role="Reader"), "大小写不同的角色名"
+        )
+        self.assertEqual(
+            wrong_case,
+            {"rules": []},
+            f"大小写敏感匹配不应命中 reader，实际为 {wrong_case!r}",
+        )
+
+    def test_export_role_treats_wildcards_literally_and_keeps_inner_space(self):
+        self.assert_success_json(
+            self.grant("a b", "p%"), "授予内部空白角色的 p%"
+        )
+        self.assert_success_json(
+            self.grant("a b", "p*"), "授予内部空白角色的 p*"
+        )
+        # 通配符片段不得匹配到 "a b"。
+        self.assertEqual(
+            self.assert_success_json(
+                self.export_rules(role="a%"), "角色名中的 % 为普通字符"
+            ),
+            {"rules": []},
+        )
+        result = self.assert_success_json(
+            self.export_rules(role="a b"), "内部空白角色名精确匹配"
+        )
+        self.assertEqual(
+            result["rules"],
+            [
+                {"role": "a b", "permission": "p%"},
+                {"role": "a b", "permission": "p*"},
+            ],
+            f"内部空白与通配符应原样保留并按码点排序，实际为 {result!r}",
+        )
+
+    def test_export_role_includes_memberless_roles(self):
+        # 即使角色没有绑定固定成员，只要存在授权也应导出。
+        self.assert_success_json(
+            self.grant("ghost", "ghost:only"), "授予无成员角色"
+        )
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "授予 reader"
+        )
+        result = self.assert_success_json(
+            self.export_rules(role="ghost"), "按无成员角色筛选"
+        )
+        self.assertEqual(
+            result["rules"],
+            [{"role": "ghost", "permission": "ghost:only"}],
+            f"无成员角色的授权应正常导出，实际为 {result!r}",
+        )
+
+    def test_export_role_empty_for_unknown_role(self):
+        self.grant_acceptance_sample()
+        result = self.assert_success_json(
+            self.export_rules(role="nobody"), "未出现的角色"
+        )
+        self.assertEqual(result, {"rules": []})
+
+    def test_export_role_empty_after_all_revoked(self):
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置授权"
+        )
+        self.assert_success_json(
+            self.run_rbac("revoke", "reader", PERMISSION_READ), "撤销授权"
+        )
+        result = self.assert_success_json(
+            self.export_rules(role="reader"), "授权全部撤销后导出"
+        )
+        self.assertEqual(result, {"rules": []})
+
+    def test_export_role_on_empty_and_missing_db(self):
+        # 已有空库。
+        self.assert_success_json(
+            self.grant("reader", PERMISSION_READ), "预置授权后撤销造空库"
+        )
+        self.assert_success_json(
+            self.run_rbac("revoke", "reader", PERMISSION_READ), "撤销唯一授权"
+        )
+        self.assertEqual(
+            self.assert_success_json(
+                self.export_rules(role="reader"), "已有空库按角色导出"
+            ),
+            {"rules": []},
+        )
+        # 文件缺失但父目录存在：沿用建库行为并返回空结果。
+        fresh_db = os.path.join(self.tmpdir, "fresh.db")
+        self.assertFalse(os.path.exists(fresh_db))
+        self.assertEqual(
+            self.assert_success_json(
+                self.export_rules(role="reader", db=fresh_db), "新库按角色导出"
+            ),
+            {"rules": []},
+        )
+        self.assertTrue(
+            os.path.exists(fresh_db), "父目录存在时应沿用建库行为创建文件"
+        )
+
+    def test_export_role_is_read_only(self):
+        self.grant_acceptance_sample()
+        rules_before = self.stored_rules()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE notes (body TEXT)")
+            conn.execute("INSERT INTO notes VALUES ('keep me')")
+
+        self.assert_success_json(self.export_rules(role="reader"), "第一次按角色导出")
+        self.assert_success_json(self.export_rules(role="editor"), "第二次按角色导出")
+
+        self.assertEqual(rules_before, self.stored_rules())
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT body FROM notes").fetchall(), [("keep me",)]
+            )
+
+    def assert_invalid_name(self, proc, argv, fresh_db_path=None):
+        """名称无效：退出码 2，stdout 为空，stderr 仅为固定错误行。"""
+        self.assertEqual(
+            proc.returncode,
+            2,
+            f"输入 {argv!r}：期望退出码 2，实际 {proc.returncode}，"
+            f"stdout={proc.stdout!r}，stderr={proc.stderr!r}",
+        )
+        self.assertEqual(
+            proc.stdout,
+            "",
+            f"输入 {argv!r}：invalid_name 时标准输出应为空，实际为 {proc.stdout!r}",
+        )
+        self.assertEqual(
+            proc.stderr,
+            INVALID_NAME_ERROR,
+            f"输入 {argv!r}：标准错误应为 {INVALID_NAME_ERROR!r}，实际为 {proc.stderr!r}",
+        )
+        if fresh_db_path is not None:
+            self.assertFalse(
+                os.path.exists(fresh_db_path),
+                f"输入 {argv!r}：invalid_name 不应创建数据库 {fresh_db_path}",
+            )
+
+    def test_export_role_blank_name_is_invalid_name(self):
+        for blank in ("", "   ", "\t\n"):
+            argv = ("export-rules", "--role", blank)
+            self.assert_invalid_name(self.run_rbac(*argv), argv)
+
+    def test_export_role_invalid_name_takes_precedence_over_storage_error(self):
+        # 空/纯空白角色名即使配合无效数据库路径，也优先判定 invalid_name，
+        # 校验先于任何数据库操作，不创建父目录或文件。
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        for blank in ("", "   "):
+            argv = ("export-rules", "--role", blank)
+            self.assert_invalid_name(
+                self.run_rbac(*argv, db=missing_parent_db),
+                argv,
+                fresh_db_path=missing_parent_db,
+            )
+
+    def test_export_role_storage_errors(self):
+        # 名称有效但存储不可用：退出码 1，stdout 为空，不覆盖或修复原数据。
+        # 1) 父目录不存在。
+        missing_parent_db = os.path.join(self.tmpdir, "missing_dir", "rules.db")
+        argv = ("export-rules", "--role", "reader")
+        self.assert_storage_error(
+            self.run_rbac(*argv, db=missing_parent_db), argv
+        )
+        self.assertFalse(os.path.exists(missing_parent_db))
+
+        # 2) 目标不是 SQLite 文件，字节保持不变。
+        bad_db = os.path.join(self.tmpdir, "not_sqlite.db")
+        original = b"this is not a sqlite database"
+        with open(bad_db, "wb") as handle:
+            handle.write(original)
+        self.assert_storage_error(self.run_rbac(*argv, db=bad_db), argv)
+        with open(bad_db, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+
+        # 3) 授权表缺少必要列，已有数据原样保留。
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE role_permissions (role TEXT NOT NULL)")
+            conn.execute("INSERT INTO role_permissions VALUES ('reader')")
+        with sqlite3.connect(self.db_path) as conn:
+            rows_before = conn.execute(
+                "SELECT role FROM role_permissions"
+            ).fetchall()
+        self.assert_storage_error(self.run_rbac(*argv, db=self.db_path), argv)
+        with sqlite3.connect(self.db_path) as conn:
+            rows_after = conn.execute(
+                "SELECT role FROM role_permissions"
+            ).fetchall()
+        self.assertEqual(rows_before, rows_after)
 
 
 if __name__ == "__main__":
