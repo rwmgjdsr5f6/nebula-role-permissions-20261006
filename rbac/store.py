@@ -199,12 +199,34 @@ def list_permissions_for_roles(conn, roles):
     权限按保存名称原样返回，去重后按完整字符串的 Unicode 码点顺序升序排列；
     角色列表为空或这些角色均无任何授权时返回空列表。
     """
-    if not roles:
-        return []
-    placeholders = ",".join("?" for _ in roles)
-    sql = "SELECT permission FROM role_permissions WHERE role IN (%s)" % placeholders
-    try:
-        rows = conn.execute(sql, list(roles)).fetchall()
-    except sqlite3.Error as exc:
-        raise StorageError(str(exc)) from exc
-    return sorted({row[0] for row in rows})
+    permissions = list_permission_sources_for_roles(conn, roles)
+    return list(permissions.keys())
+
+
+def list_permission_sources_for_roles(conn, roles):
+    """汇总多个角色的获授权限及其授权来源角色；本函数只执行只读查询。
+
+    仅查询入参角色（调用方传入成员固定绑定的角色）当前确实获授的权限，
+    其他角色的授权不进入结果。返回权限名 -> 来源角色列表的有序字典：
+    权限去重后按完整名称的 Unicode 码点顺序升序排列，每个权限的来源角色
+    同样去重后按完整角色名的 Unicode 码点顺序升序排列；名称按保存值原样
+    返回，保留大小写与内部空白，"*"、"%"、"_" 均为普通字符。角色列表为空
+    或这些角色均无任何授权时返回空字典。
+    """
+    sources = {}
+    if roles:
+        placeholders = ",".join("?" for _ in roles)
+        sql = (
+            "SELECT permission, role FROM role_permissions "
+            "WHERE role IN (%s)" % placeholders
+        )
+        try:
+            rows = conn.execute(sql, list(roles)).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(str(exc)) from exc
+        for permission, role in rows:
+            sources.setdefault(permission, set()).add(role)
+    return {
+        permission: sorted(role_set)
+        for permission, role_set in sorted(sources.items())
+    }

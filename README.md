@@ -63,6 +63,24 @@ $ python -m rbac --db rules.db list-role-members editor
 
 `editor` 未绑定任何固定成员，空数组是正常空结果（退出码 0），不是执行失败；`Reader` 不会匹配 `reader`。成员名保留配置原值，去重后按完整名称的 Unicode 码点升序排列。
 
+## 汇总成员权限及授权来源
+
+`list-member-permissions` 汇总成员固定角色当前拥有的全部权限。默认输出 `member`、`roles`、`permissions` 三个字段：
+
+```console
+$ python -m rbac --db rules.db list-member-permissions alice
+{"member":"alice","roles":["reader"],"permissions":["documents:read"]}
+```
+
+加上 `--explain` 后仅额外增加一个 `sources` 数组，其余字段与输出格式不变。`sources` 与 `permissions` 一一对应，每项只含 `permission` 与 `roles`：`roles` 是成员固定绑定、且确实获授该权限的角色（其他角色即使持有该权限也不出现），权限和角色均去重并按完整名称的 Unicode 码点升序排列，不出现空来源项：
+
+```console
+$ python -m rbac --db rules.db list-member-permissions alice --explain
+{"member":"alice","roles":["reader"],"permissions":["documents:read"],"sources":[{"permission":"documents:read","roles":["reader"]}]}
+```
+
+撤销该授权后再次解释查询，`permissions` 与 `sources` 均为空数组，而 `roles` 仍为 `["reader"]`；未配置的成员（如 `bob` 或大小写不同的 `Alice`）返回空 `roles`、`permissions`、`sources`。该开关沿用同一名称校验与存储边界，且查询为只读。
+
 ## 名称规则
 
 所有成员名、角色名、权限名先去除首尾空白，再按完整字符串做**大小写敏感**的精确匹配。
@@ -84,7 +102,7 @@ python -m rbac --db FILE list-permissions ROLE
 python -m rbac --db FILE list-permission-roles PERMISSION
 python -m rbac --db FILE list-permission-members PERMISSION
 python -m rbac --db FILE list-role-members ROLE
-python -m rbac --db FILE list-member-permissions MEMBER
+python -m rbac --db FILE list-member-permissions MEMBER [--explain]
 python -m rbac --db FILE list-roles
 python -m rbac --db FILE list-all-permissions
 python -m rbac --db FILE export-rules
