@@ -193,50 +193,71 @@ def list_roles(conn):
     return sorted({row[0] for row in rows})
 
 
-def list_permissions_for_roles(conn, roles):
-    """汇总多个角色当前已获授权限的去重合集；本函数只执行只读查询。
+def _aggregate_permission_sources(conn, roles):
+    """在入参角色集合内汇总“权限 -> 直接获授该权限的角色列表”映射。
 
-    权限按保存名称原样返回，去重后按完整字符串的 Unicode 码点顺序升序排列；
-    角色列表为空或这些角色均无任何授权时返回空列表。
-    """
-    if not roles:
-        return []
-    placeholders = ",".join("?" for _ in roles)
-    sql = "SELECT permission FROM role_permissions WHERE role IN (%s)" % placeholders
-    try:
-        rows = conn.execute(sql, list(roles)).fetchall()
-    except sqlite3.Error as exc:
-        raise StorageError(str(exc)) from exc
-    return sorted({row[0] for row in rows})
+    这是普通权限清单与 --explain 来源解释共用的唯一汇总点：角色范围
+    筛选、权限与角色去重、按完整名称 Unicode 码点升序排列都只在此维护
+    一次，两个公开入口分别从同一份结果投影出权限列表或完整来源映射。
+    权限与角色均按保存名称原样返回（保留大小写与内部空白，"*"、"%"、
+    "_" 均为普通字符）；映射中的角色必然同时满足“属于入参角色”与
+    “确实直接获授对应权限”，没有任何入参角色获授的权限不产生条目。
 
-
-def list_permission_roles_for_roles(conn, roles):
-    """汇总多个角色当前的“权限 -> 直接获授该权限的角色列表”映射；只读查询。
-
-    只在入参角色范围内统计：映射中的角色必然同时满足“属于入参角色”与
-    “确实直接获授对应权限”，其他角色（即使也获授同一权限）不出现；
-    没有任何入参角色获授的权限不产生条目，因此每个权限对应的角色列表
-    必非空。权限与角色均按保存名称原样返回（保留大小写与内部空白，
-    "*"、"%"、"_" 均为普通字符），各自去重后按完整名称的 Unicode 码点
-    顺序升序排列。角色列表为空时直接返回空字典，不向规则表发起查询，
-    因此与 list_permissions_for_roles 一样，空角色路径不暴露缺列等
-    表结构问题。
+    入参角色为空时不向规则表发起任何查询、直接返回空字典，使空结果
+    路径不暴露缺列等表结构问题；非空角色集合的任何 sqlite3 失败统一
+    包装为 StorageError。本函数只执行只读查询。
     """
     if not roles:
         return {}
-    placeholders = ",".join("?" for _ in roles)
+    # 入参角色去重后再生成占位符：重复或无授权角色不改变有效结果；
+    # 这里另建集合，不修改调用方传入的角色列表。
+    role_filter = set(roles)
+    placeholders = ",".join("?" for _ in role_filter)
     sql = (
         "SELECT permission, role FROM role_permissions "
         "WHERE role IN (%s)" % placeholders
     )
     try:
-        rows = conn.execute(sql, list(roles)).fetchall()
+        rows = conn.execute(sql, list(role_filter)).fetchall()
     except sqlite3.Error as exc:
         raise StorageError(str(exc)) from exc
+    # 同一权限下的来源角色经集合去重；权限键经字典键去重。
     role_sets = {}
     for permission, role in rows:
         role_sets.setdefault(permission, set()).add(role)
+    # 权限键与来源角色各自按完整名称的 Unicode 码点升序排列；字典按
+    # 权限升序插入，故 list_permissions_for_roles 直接取键即为排序列表。
     return {
         permission: sorted(role_sets[permission])
         for permission in sorted(role_sets)
     }
+
+
+def list_permissions_for_roles(conn, roles):
+    """汇总多个角色当前已获授权限的去重合集；本函数只执行只读查询。
+
+    与 list_permission_roles_for_roles 共用同一次角色范围汇总
+    （见 _aggregate_permission_sources）：角色筛选、权限去重与排序不
+    在本入口重复维护，这里只投影汇总结果中的权限名。权限按保存名称
+    原样返回，去重后按完整字符串的 Unicode 码点顺序升序排列；角色
+    列表为空或这些角色均无任何授权时返回空列表，且空角色路径不查询
+    规则表（缺列等表结构问题不会被触发）。
+    """
+    return list(_aggregate_permission_sources(conn, roles))
+
+
+def list_permission_roles_for_roles(conn, roles):
+    """汇总多个角色当前的“权限 -> 直接获授该权限的角色列表”映射；只读查询。
+
+    与 list_permissions_for_roles 共用同一次角色范围汇总
+    （见 _aggregate_permission_sources），角色筛选、权限去重与码点排序
+    均不在本入口重复维护。只在入参角色范围内统计：映射中的角色必然
+    同时满足“属于入参角色”与“确实直接获授对应权限”，其他角色（即使
+    也获授同一权限）不出现；没有任何入参角色获授的权限不产生条目，
+    因此每个权限对应的角色列表必非空。权限与角色均按保存名称原样
+    返回（保留大小写与内部空白，"*"、"%"、"_" 均为普通字符），各自
+    去重后按完整名称的 Unicode 码点顺序升序排列。角色列表为空时直接
+    返回空字典，不向规则表发起查询，因此与 list_permissions_for_roles
+    一样，空角色路径不暴露缺列等表结构问题。
+    """
+    return _aggregate_permission_sources(conn, roles)
