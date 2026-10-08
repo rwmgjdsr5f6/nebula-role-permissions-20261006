@@ -2,7 +2,7 @@
 
     python -m rbac --db FILE grant ROLE PERMISSION
     python -m rbac --db FILE revoke ROLE PERMISSION
-    python -m rbac --db FILE check MEMBER PERMISSION
+    python -m rbac --db FILE check MEMBER PERMISSION [--explain]
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-permission-members PERMISSION
@@ -58,6 +58,11 @@ def _build_parser():
     check_parser = subparsers.add_parser("check", help="查询成员是否拥有某权限")
     check_parser.add_argument("member")
     check_parser.add_argument("permission")
+    check_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="额外输出实际直接获授请求权限的成员固定角色（granted_roles）",
+    )
 
     list_parser = subparsers.add_parser(
         "list-permissions", help="列出角色直接获授的全部权限"
@@ -217,10 +222,27 @@ def main(argv=None):
                 # 角色只解析一次：存储匹配与决定中的角色说明共用同一次
                 # roles_for 结果，避免重复处理造成两者不一致。
                 roles = policy.roles_for(target_name)
-                granted = store.permission_granted(conn, roles, permission)
-                result = policy.decide(
-                    target_name, permission, granted, roles=roles
-                )
+                if args.explain:
+                    # 允许与否及来源角色取自同一次、且只按成员固定角色
+                    # 范围的查询：granted_roles 中的角色必然同时满足
+                    # “绑定于该成员”与“确实直接获授请求权限”，故其他
+                    # 角色（即使同获授该权限）不出现，allowed 与
+                    # granted_roles 非空也必然一致。
+                    granted_roles = store.list_granted_roles_for_permission(
+                        conn, roles, permission
+                    )
+                    result = policy.decide(
+                        target_name,
+                        permission,
+                        bool(granted_roles),
+                        roles=roles,
+                        granted_roles=granted_roles,
+                    )
+                else:
+                    granted = store.permission_granted(conn, roles, permission)
+                    result = policy.decide(
+                        target_name, permission, granted, roles=roles
+                    )
         except store.StorageError:
             _fail("storage_error")
             return 1

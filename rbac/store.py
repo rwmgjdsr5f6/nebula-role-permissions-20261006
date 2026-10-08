@@ -99,18 +99,39 @@ def revoke_permission(conn, role, permission):
 
 def permission_granted(conn, roles, permission):
     """任一直接角色拥有该权限即为 True；本函数只执行只读查询。"""
+    return bool(list_granted_roles_for_permission(conn, roles, permission))
+
+
+def list_granted_roles_for_permission(conn, roles, permission):
+    """列出入参角色中直接获授指定权限的角色；本函数只执行只读查询。
+
+    只在入参角色集合内统计：返回的角色必然同时满足“属于入参角色”
+    （即成员固定绑定的直接角色）与“确实直接获授请求权限”；其他角色
+    即使也获授同一权限也不出现。权限按完整名称大小写敏感精确匹配
+    （"*"、"%"、"_" 均为普通字符）。角色按保存名称原样返回，去重后
+    按完整名称的 Unicode 码点升序排列；没有任何入参角色获授该权限时
+    返回空列表。
+
+    入参角色为空时不向规则表发起任何查询、直接返回空列表，使空结果
+    路径不暴露缺列等表结构问题；非空角色集合的任何 sqlite3 失败统一
+    包装为 StorageError。permission_granted 与本函数共用同一条
+    SELECT，允许与否的布尔判断与具体获授角色来自同一查询结果。
+    """
     if not roles:
-        return False
-    placeholders = ",".join("?" for _ in roles)
+        return []
+    # 入参角色去重后再生成占位符：重复角色不改变有效结果；这里另建
+    # 集合，不修改调用方传入的角色列表。
+    role_filter = set(roles)
+    placeholders = ",".join("?" for _ in role_filter)
     sql = (
-        "SELECT 1 FROM role_permissions "
-        "WHERE permission = ? AND role IN (%s) LIMIT 1" % placeholders
+        "SELECT role FROM role_permissions "
+        "WHERE permission = ? AND role IN (%s)" % placeholders
     )
     try:
-        row = conn.execute(sql, [permission] + list(roles)).fetchone()
+        rows = conn.execute(sql, [permission] + list(role_filter)).fetchall()
     except sqlite3.Error as exc:
         raise StorageError(str(exc)) from exc
-    return row is not None
+    return sorted({row[0] for row in rows})
 
 
 def list_permissions(conn, role):

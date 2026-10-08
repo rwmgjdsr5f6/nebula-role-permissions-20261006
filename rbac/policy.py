@@ -67,7 +67,7 @@ def members_for_permission(granted_roles):
     ]
 
 
-def decide(member, permission, granted, roles=None):
+def decide(member, permission, granted, roles=None, granted_roles=None):
     """依据成员角色与规则匹配结果生成决定。
 
     granted 表示该成员的任一直接角色是否直接拥有请求的权限。
@@ -76,8 +76,15 @@ def decide(member, permission, granted, roles=None):
     roles_for 取角色、再以同一角色列表查询存储）：传入时直接沿用，
     使授权判断所用角色与结果中说明的角色来自同一次解析；省略时仍由
     本函数调用 roles_for(member) 解析。无论哪种来源，返回的 roles 都是
-    新建列表，与入参列表及固定配置相互独立。本函数为纯内存计算，
-    不访问存储。
+    新建列表，与入参列表及固定配置相互独立。
+
+    granted_roles 为该成员固定绑定、且确实直接获授请求权限的角色列表
+    （check --explain 链路与 granted 取自同一次存储查询）：仅当显式
+    传入（即使为空列表）时，结果才额外包含 granted_roles 字段，值为
+    入参列表的新建副本，调用方负责其中角色的去重与码点排序；省略时
+    结果保持 member、permission、roles、allowed、reason 五个字段不变。
+    granted_roles 只作来源说明，不参与决定逻辑，allowed/reason 仍只由
+    roles 与 granted 决定。本函数为纯内存计算，不访问存储。
     """
     roles = roles_for(member) if roles is None else list(roles)
     if not roles:
@@ -90,10 +97,14 @@ def decide(member, permission, granted, roles=None):
     else:
         allowed = False
         reason = REASON_PERMISSION_NOT_GRANTED
-    return {
+    result = {
         "member": member,
         "permission": permission,
         "roles": roles,
         "allowed": allowed,
         "reason": reason,
     }
+    if granted_roles is not None:
+        # 另建副本，与调用方手中的来源列表相互独立；不与 roles 共享对象。
+        result["granted_roles"] = list(granted_roles)
+    return result
