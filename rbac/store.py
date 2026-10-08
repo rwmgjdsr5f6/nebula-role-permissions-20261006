@@ -208,3 +208,35 @@ def list_permissions_for_roles(conn, roles):
     except sqlite3.Error as exc:
         raise StorageError(str(exc)) from exc
     return sorted({row[0] for row in rows})
+
+
+def list_permission_roles_for_roles(conn, roles):
+    """汇总多个角色当前的“权限 -> 直接获授该权限的角色列表”映射；只读查询。
+
+    只在入参角色范围内统计：映射中的角色必然同时满足“属于入参角色”与
+    “确实直接获授对应权限”，其他角色（即使也获授同一权限）不出现；
+    没有任何入参角色获授的权限不产生条目，因此每个权限对应的角色列表
+    必非空。权限与角色均按保存名称原样返回（保留大小写与内部空白，
+    "*"、"%"、"_" 均为普通字符），各自去重后按完整名称的 Unicode 码点
+    顺序升序排列。角色列表为空时直接返回空字典，不向规则表发起查询，
+    因此与 list_permissions_for_roles 一样，空角色路径不暴露缺列等
+    表结构问题。
+    """
+    if not roles:
+        return {}
+    placeholders = ",".join("?" for _ in roles)
+    sql = (
+        "SELECT permission, role FROM role_permissions "
+        "WHERE role IN (%s)" % placeholders
+    )
+    try:
+        rows = conn.execute(sql, list(roles)).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    role_sets = {}
+    for permission, role in rows:
+        role_sets.setdefault(permission, set()).add(role)
+    return {
+        permission: sorted(role_sets[permission])
+        for permission in sorted(role_sets)
+    }

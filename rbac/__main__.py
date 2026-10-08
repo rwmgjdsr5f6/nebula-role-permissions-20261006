@@ -7,7 +7,7 @@
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-permission-members PERMISSION
     python -m rbac --db FILE list-role-members ROLE
-    python -m rbac --db FILE list-member-permissions MEMBER
+    python -m rbac --db FILE list-member-permissions MEMBER [--explain]
     python -m rbac --db FILE list-roles
     python -m rbac --db FILE list-all-permissions
     python -m rbac --db FILE export-rules
@@ -68,6 +68,11 @@ def _build_parser():
         "list-member-permissions", help="汇总成员直接角色当前拥有的全部权限"
     )
     member_list_parser.add_argument("member")
+    member_list_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="额外输出每项权限的获授来源角色（sources）",
+    )
 
     permission_roles_parser = subparsers.add_parser(
         "list-permission-roles", help="列出直接获授某权限的全部角色"
@@ -183,12 +188,31 @@ def main(argv=None):
                 result = {"role": target_name, "members": members}
             elif args.command == "list-member-permissions":
                 roles = policy.roles_for(target_name)
-                permissions = store.list_permissions_for_roles(conn, roles)
-                result = {
-                    "member": target_name,
-                    "roles": roles,
-                    "permissions": permissions,
-                }
+                if args.explain:
+                    # permissions 与 sources 取自同一次、且只按成员固定
+                    # 角色范围的查询：sources 与 permissions 一一对应，
+                    # 每项来源角色都确实绑定于该成员并获授对应权限，
+                    # 因而不会出现空来源项。
+                    permission_roles = store.list_permission_roles_for_roles(
+                        conn, roles
+                    )
+                    permissions = list(permission_roles.keys())
+                    result = {
+                        "member": target_name,
+                        "roles": roles,
+                        "permissions": permissions,
+                        "sources": [
+                            {"permission": permission, "roles": source_roles}
+                            for permission, source_roles in permission_roles.items()
+                        ],
+                    }
+                else:
+                    permissions = store.list_permissions_for_roles(conn, roles)
+                    result = {
+                        "member": target_name,
+                        "roles": roles,
+                        "permissions": permissions,
+                    }
             else:
                 # 角色只解析一次：存储匹配与决定中的角色说明共用同一次
                 # roles_for 结果，避免重复处理造成两者不一致。
