@@ -190,10 +190,13 @@ def main(argv=None):
                     "permissions": permissions,
                 }
             else:
-                granted = store.permission_granted(
-                    conn, policy.roles_for(target_name), permission
+                # 角色只解析一次：存储匹配与决定中的角色说明共用同一次
+                # roles_for 结果，避免重复处理造成两者不一致。
+                roles = policy.roles_for(target_name)
+                granted = store.permission_granted(conn, roles, permission)
+                result = policy.decide(
+                    target_name, permission, granted, roles=roles
                 )
-                result = policy.decide(target_name, permission, granted)
         except store.StorageError:
             _fail("storage_error")
             return 1
