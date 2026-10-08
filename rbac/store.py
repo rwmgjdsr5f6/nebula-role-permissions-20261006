@@ -113,6 +113,34 @@ def permission_granted(conn, roles, permission):
     return row is not None
 
 
+def list_granted_roles_for_permission(conn, roles, permission):
+    """入参角色中确实直接获授指定权限的角色列表；本函数只执行只读查询。
+
+    这是 check --explain 的来源查询：只在入参角色范围内统计，返回的角色必然
+    同时满足“属于入参角色”与“确实直接获授该权限”；范围外的角色（即使也
+    获授同一权限）不出现。权限按完整名称大小写敏感精确匹配（"*"、"%"、
+    "_" 均为普通字符）；角色按保存名称原样返回，去重后按完整字符串的
+    Unicode 码点顺序升序排列。入参角色为空时不向规则表发起任何查询、
+    直接返回空列表，使空结果路径不暴露缺列等表结构问题；非空角色集合的
+    任何 sqlite3 失败统一包装为 StorageError。
+    """
+    if not roles:
+        return []
+    # 入参角色去重后再生成占位符：重复角色不改变有效结果；这里另建集合，
+    # 不修改调用方传入的角色列表。
+    role_filter = set(roles)
+    placeholders = ",".join("?" for _ in role_filter)
+    sql = (
+        "SELECT role FROM role_permissions "
+        "WHERE permission = ? AND role IN (%s)" % placeholders
+    )
+    try:
+        rows = conn.execute(sql, [permission] + list(role_filter)).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError(str(exc)) from exc
+    return sorted({row[0] for row in rows})
+
+
 def list_permissions(conn, role):
     """列出角色直接获授的全部权限；本函数只执行只读查询。
 

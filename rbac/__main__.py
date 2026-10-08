@@ -2,7 +2,7 @@
 
     python -m rbac --db FILE grant ROLE PERMISSION
     python -m rbac --db FILE revoke ROLE PERMISSION
-    python -m rbac --db FILE check MEMBER PERMISSION
+    python -m rbac --db FILE check MEMBER PERMISSION [--explain]
     python -m rbac --db FILE list-permissions ROLE
     python -m rbac --db FILE list-permission-roles PERMISSION
     python -m rbac --db FILE list-permission-members PERMISSION
@@ -58,6 +58,11 @@ def _build_parser():
     check_parser = subparsers.add_parser("check", help="查询成员是否拥有某权限")
     check_parser.add_argument("member")
     check_parser.add_argument("permission")
+    check_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="额外输出实际授予请求权限的固定角色（granted_roles）",
+    )
 
     list_parser = subparsers.add_parser(
         "list-permissions", help="列出角色直接获授的全部权限"
@@ -217,9 +222,23 @@ def main(argv=None):
                 # 角色只解析一次：存储匹配与决定中的角色说明共用同一次
                 # roles_for 结果，避免重复处理造成两者不一致。
                 roles = policy.roles_for(target_name)
-                granted = store.permission_granted(conn, roles, permission)
+                if args.explain:
+                    # 来源只针对请求权限：在成员固定角色范围内查出确实
+                    # 直接获授该权限的角色；允许判定与 granted_roles 取自
+                    # 同一次查询，二者必然一致。空角色路径不查询规则表。
+                    granted_roles = store.list_granted_roles_for_permission(
+                        conn, roles, permission
+                    )
+                    granted = bool(granted_roles)
+                else:
+                    granted_roles = None
+                    granted = store.permission_granted(conn, roles, permission)
                 result = policy.decide(
-                    target_name, permission, granted, roles=roles
+                    target_name,
+                    permission,
+                    granted,
+                    roles=roles,
+                    granted_roles=granted_roles,
                 )
         except store.StorageError:
             _fail("storage_error")

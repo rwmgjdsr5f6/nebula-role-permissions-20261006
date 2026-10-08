@@ -50,6 +50,17 @@ $ python -m rbac --db rules.db check bob documents:read
 
 `check` 等查询命令不改动任何授权记录；但如果规则文件尚不存在且父目录可写，首次调用（包括查询）仍会创建该文件。
 
+## 查看实际授予权限的角色
+
+`check` 加上可选的 `--explain` 开关后，输出仅额外增加一个 `granted_roles` 数组，列出该成员固定绑定、且确实直接获授请求权限的角色（去重后按完整角色名的 Unicode 码点升序排列）：
+
+```console
+$ python -m rbac --db rules.db check alice documents:read --explain
+{"member":"alice","permission":"documents:read","roles":["reader"],"allowed":true,"reason":"直接角色授权","granted_roles":["reader"]}
+```
+
+来源只针对本次请求的权限：即使 `editor` 也获授了 `documents:read`，由于 `alice` 只固定绑定 `reader`，`granted_roles` 中不会出现 `editor`。`roles` 仍表示成员的全部固定角色，保留原顺序与重复项，不随是否命中过滤。撤销 `reader` 的这条授权后，`allowed` 变为 `false`、`reason` 为“权限未授予”、`granted_roles` 为 `[]`，而 `roles` 仍为 `["reader"]`；未配置的成员（如 `bob` 或大小写不同的 `Alice`）两个角色数组都为空。不带 `--explain` 时输出保持 `member`、`permission`、`roles`、`allowed`、`reason` 五个字段不变。
+
 ## 按角色查询固定成员
 
 `list-role-members` 直接查看某角色当前固定关联的合成成员，结果只取决于源码中的固定成员关系，与库中的授权无关：
@@ -97,7 +108,7 @@ $ python -m rbac --db rules.db list-member-permissions alice --explain
 ```text
 python -m rbac --db FILE grant ROLE PERMISSION
 python -m rbac --db FILE revoke ROLE PERMISSION
-python -m rbac --db FILE check MEMBER PERMISSION
+python -m rbac --db FILE check MEMBER PERMISSION [--explain]
 python -m rbac --db FILE list-permissions ROLE
 python -m rbac --db FILE list-permission-roles PERMISSION
 python -m rbac --db FILE list-permission-members PERMISSION
