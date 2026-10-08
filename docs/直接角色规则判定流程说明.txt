@@ -9,12 +9,13 @@
 
 核对基准
 --------
-- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverA/task024
+- 仓库根目录：/mnt/c/NebulaForge/projects/forge11/solverB/task040
   （即包含 rbac/ 包、docs/ 与 tests/ 的目录；受版本控制的完整文件清单
   可用 `git ls-files` 自行核对。）
 - 本文结论直接依据的当前源码文件与函数：
     rbac/__main__.py  —— main()、_build_parser()、_emit()、_fail()
-    rbac/policy.py    —— normalize_name()、roles_for()、decide()、
+    rbac/policy.py    —— normalize_name()、roles_for()、
+                         decide()（含 roles=None 入参及其默认读取分支）、
                          FIXED_MEMBER_ROLES、REASON_ALLOWED、
                          REASON_PERMISSION_NOT_GRANTED、
                          REASON_MEMBER_NOT_CONFIGURED
@@ -65,46 +66,77 @@ README.md 当前已说明：SQLite 只保存“角色 -> 权限”规则，成�
    rbac/__main__.py main() 中连接处的 try/except store.StorageError。
 
 3. 固定角色读取
-   对 check，main() 调用 policy.roles_for(member)：成员角色只来自源码
-   内的固定配置 FIXED_MEMBER_ROLES（当前仅 "alice": ("reader",)），
-   配置中不存在的成员得到空列表。该对应关系不入库，grant 与任何其他
-   命令都无法修改它；数据库中只保存“角色 -> 权限”这一类规则
-   （rbac/store.py 模块 docstring 与 rbac/policy.py FIXED_MEMBER_ROLES
-   上方注释均明确这一边界）。
-   核对位置：rbac/policy.py FIXED_MEMBER_ROLES、roles_for()。
+   对 check，main() 调用且只调用一次 policy.roles_for(member)：成员角色
+   只来自源码内的固定配置 FIXED_MEMBER_ROLES（当前仅
+   "alice": ("reader",)），配置中不存在的成员得到空列表。该对应关系不入
+   库，grant 与任何其他命令都无法修改它；数据库中只保存“角色 -> 权限”
+   这一类规则（rbac/store.py 模块 docstring 与 rbac/policy.py
+   FIXED_MEMBER_ROLES 上方注释均明确这一边界）。
+   roles_for() 的返回值是按配置内容新建的列表（list(roles) 或 []），
+   与 FIXED_MEMBER_ROLES 中的元组不共享对象。main() 把这唯一一次读取
+   得到的角色列表保存到局部变量 roles：第 4 步把该对象直接传入
+   permission_granted()，第 5 步把同一个 roles 作为关键字参数传给
+   decide()（decide 内部只复制其内容，细节见第 5 步）；两处使用的是
+   同一次读取的结果，main() 不会第二次调用 roles_for()——整个 check
+   调用中 roles_for() 恰好执行一次。
+   核对位置：rbac/policy.py FIXED_MEMBER_ROLES、roles_for()；
+   rbac/__main__.py main() 的 check 分支（else 分支）中
+   `roles = policy.roles_for(target_name)` 一行及其下方对 roles 的
+   两次复用，行内注释“角色只解析一次：存储匹配与决定中的角色说明共用
+   同一次 roles_for 结果”。
 
 4. 直接授权匹配
    - grant 走 store.grant_permission()：先按规整后的（角色, 权限）
      组合精确查询，组合已存在即按幂等成功返回；不存在则执行普通
      INSERT、提交并复查该组合确实可读出，任何 sqlite3 失败统一包装
      为 StorageError。
-   - check 走 store.permission_granted(conn, roles, permission)：
-     roles 为空时直接返回 False，不向规则表发出任何 SQL；roles 非空
-     时执行只读 SELECT，判定这些角色中是否有任一行的 permission 与
-     请求权限精确相等（大小写敏感，"*"、"%" 等均为普通字符）。
+   - check 走 store.permission_granted(conn, roles, permission)，其
+     roles 实参就是上一步那一次 roles_for() 的结果（main() 不重新
+     读取）：roles 为空时直接返回 False，不向规则表发出任何 SQL；
+     roles 非空时执行只读 SELECT，判定这些角色中是否有任一行的
+     permission 与请求权限精确相等（大小写敏感，"*"、"%" 等均为普通
+     字符）。
    核对位置：rbac/store.py grant_permission()、permission_granted()；
-   rbac/__main__.py main() 中 check 分支
-   （permission_granted(conn, policy.roles_for(...), permission)）。
+   rbac/__main__.py main() check 分支中的
+   `granted = store.permission_granted(conn, roles, permission)`。
 
 5. 结果输出
-   main() 将上一步的匹配布尔值交给 policy.decide(member, permission,
-   granted)，由它再次读取固定角色并选择结论：
+   main() 将第 3 步读取的 roles 与第 4 步的匹配布尔值一并交给
+   policy.decide(target_name, permission, granted, roles=roles)：
+   显式传入 roles 时，decide() 不再读取固定配置，只对入参列表执行
+   list(roles) 复制后直接使用，因此授权判断（第 4 步的
+   permission_granted）与结果中说明的角色来自同一次 roles_for 读取，
+   不存在两次解析互相不一致的可能。决定规则仅按角色与匹配布尔值选择：
    - 角色列表为空            -> allowed=false，reason="成员未配置"；
    - 有角色且匹配命中        -> allowed=true， reason="直接角色授权"；
    - 有角色但无任何匹配行    -> allowed=false，reason="权限未授予"。
+   decide() 另有默认分支：省略 roles（即 roles=None，例如测试或其他
+   调用方直接调用 decide(member, permission, granted)）时，它才在
+   函数内部自行调用 roles_for(member) 读取一次；该默认读取只服务于
+   不经过 check 命令链路的直接调用，check 链路不会触发它。无论角色
+   来自入参复制还是默认读取，返回字典中的 roles 总是新建列表，与入参
+   列表、roles_for() 的返回值及 FIXED_MEMBER_ROLES 配置相互独立：
+   修改返回的 roles 不影响固定配置，也不影响后续调用；roles 原样保留
+   该成员的全部固定直接角色（含配置中的顺序与重复项），不按是否命中
+   授权做筛选，“命中授权的是哪个角色”不在输出中推断。decide() 为纯
+   内存计算，不访问存储。
    结果对象经 _emit() 写到标准输出：json.dumps 使用紧凑分隔符
    (",", ":")、ensure_ascii=False（中文原因原样输出），末尾恰好追加
    一个换行；main() 开头还将 stdout/stderr 重配置为 UTF-8，保证任何
    区域配置下中文原因按 UTF-8 输出。
-   核对位置：rbac/policy.py decide() 及三个 REASON_* 常量；
-   rbac/__main__.py _emit()、_fail() 与 main() 开头的 reconfigure 段。
+   核对位置：rbac/policy.py decide()（roles=None 默认分支、
+   list(roles) 复制与三个 REASON_* 常量）及 roles_for()；
+   rbac/__main__.py check 分支对 decide() 的调用、_emit()、_fail()
+   与 main() 开头的 reconfigure 段。
 
 
-二、主流程样例（按源码可核对的预期）
+二、主流程样例（按源码推导的预期）
 ------------------------------------
-共同前提：父目录（当前工作目录）已存在且可写，rules.db 尚不存在。
-以下命令在仓库根目录执行；每一步成功调用均为：退出码 0，标准错误
-为空，标准输出恰为一行 UTF-8 JSON 加一个换行。
+共同前提：父目录（当前工作目录）已存在且可写。以下命令在仓库根目录
+执行；所有成功调用（包括三类 check 业务结果：允许、权限未授予、成员
+未配置）均为：退出码 0，标准错误为空，标准输出恰为一行 UTF-8 JSON
+加一个换行，JSON 中的成员名与权限名一律为规整后的值。下列 JSON 均为
+按当前源码推导的预期，不是某次实跑记录。
 
 1) 授予 reader 角色 documents:read 权限：
 
@@ -114,12 +146,16 @@ README.md 当前已说明：SQLite 只保存“角色 -> 权限”规则，成�
 
     {"role":"reader","permission":"documents:read"}
 
-   预期副作用：rules.db 被创建，role_permissions 表就绪，并写入一条
-   (reader, documents:read) 记录。重复执行同一 grant 为幂等：
-   grant_permission() 的写入前精确查询命中既有组合即成功返回，
-   表中始终只有这一条记录。
+   预期副作用：rules.db 不存在时被创建，role_permissions 表就绪，并
+   写入一条 (reader, documents:read) 记录；规则本已存在时 grant 幂等
+   成功、不新增记录。grant_permission() 的写入前精确查询命中既有组合
+   即成功返回，重复执行同一 grant 后表中始终只有这一条记录。
 
 2) 查询 alice 是否拥有 documents:read：
+
+   本步起三个 check 样例的共同前提：rules.db 中已存在 reader ->
+   documents:read 的授权（由第 1 步 grant 建立；若该规则本就存在于
+   库中，输出相同）。
 
     python -m rbac --db rules.db check alice documents:read
 
@@ -127,8 +163,12 @@ README.md 当前已说明：SQLite 只保存“角色 -> 权限”规则，成�
 
     {"member":"alice","permission":"documents:read","roles":["reader"],"allowed":true,"reason":"直接角色授权"}
 
-   即 alice 的角色为 ["reader"]，allowed 为 true，原因是“直接角色
-   授权”：固定角色 reader 已在库中获授该权限。
+   即 allowed 为 true，roles 为 ["reader"]，原因是“直接角色授权”：
+   check 链路唯一一次 roles_for("alice") 读出固定直接角色 reader，
+   同一次读取的角色在库中命中该权限。roles 保留该成员的全部固定直接
+   角色（当前仅 reader 一个），不按命中授权筛选；该列表是 decide()
+   新建并返回的独立副本，与 main() 中传入的列表及 FIXED_MEMBER_ROLES
+   配置都不共享对象。
 
 3) 同一库查询未授予的 documents:write：
 
@@ -138,9 +178,10 @@ README.md 当前已说明：SQLite 只保存“角色 -> 权限”规则，成�
 
     {"member":"alice","permission":"documents:write","roles":["reader"],"allowed":false,"reason":"权限未授予"}
 
-   alice 有角色 reader，但 role_permissions 中不存在
-   (reader, documents:write)，故 allowed 为 false，原因为“权限未
-   授予”。这是正常业务拒绝，不是执行失败：退出码仍为 0。
+   alice 有角色 reader（roles 同样原样输出为 ["reader"]），但
+   role_permissions 中不存在 (reader, documents:write)，故 allowed
+   为 false，原因为“权限未授予”。这是正常业务拒绝，不是执行失败：
+   退出码仍为 0，标准错误为空。
 
 4) 同一库查询固定配置中不存在的 bob：
 
@@ -151,8 +192,10 @@ README.md 当前已说明：SQLite 只保存“角色 -> 权限”规则，成�
     {"member":"bob","permission":"documents:read","roles":[],"allowed":false,"reason":"成员未配置"}
 
    bob 的 roles 为空，allowed 为 false，原因为“成员未配置”，同样以
-   退出码 0 结束。由于 permission_granted() 对空角色列表直接返回
-   False，该判定不查询规则表（此性质在第三节存储边界中同样关键）。
+   退出码 0 结束、标准错误为空；输出仍回显规整后的成员名 "bob" 与
+   权限名 "documents:read"。由于 permission_granted() 对空角色列表
+   直接返回 False，该判定不查询规则表（此性质在第三节存储边界中同样
+   关键）。
 
 
 三、正常拒绝与执行失败的区分（逐条可核对）
