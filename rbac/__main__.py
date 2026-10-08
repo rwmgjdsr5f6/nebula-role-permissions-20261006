@@ -10,7 +10,7 @@
     python -m rbac --db FILE list-member-permissions MEMBER [--explain]
     python -m rbac --db FILE list-roles
     python -m rbac --db FILE list-all-permissions
-    python -m rbac --db FILE export-rules
+    python -m rbac --db FILE export-rules [--role ROLE]
 
 退出码约定：
 - 0：成功，标准输出为一个 JSON 对象；
@@ -103,8 +103,13 @@ def _build_parser():
         "list-all-permissions",
         help="列出当前至少被一个角色直接获授的全部权限名",
     )
-    subparsers.add_parser(
+    export_parser = subparsers.add_parser(
         "export-rules", help="导出库中现存的全部直接角色授权规则"
+    )
+    export_parser.add_argument(
+        "--role",
+        default=None,
+        help="只导出指定角色当前保存的授权；省略时导出全部角色的授权",
     )
     return parser
 
@@ -118,9 +123,13 @@ def main(argv=None):
 
     args = _build_parser().parse_args(argv)
 
-    if args.command in ("export-rules", "list-roles", "list-all-permissions"):
+    if args.command in ("list-roles", "list-all-permissions"):
         # 不接收成员、角色或权限参数，无需名称校验。
         raw_names = ()
+    elif args.command == "export-rules":
+        # --role 缺省（None）时全量导出，无需名称校验；显式传入时
+        # （含空字符串）先经名称规整，校验先于任何数据库操作。
+        raw_names = (args.role,) if args.role is not None else ()
     elif args.command in ("grant", "revoke"):
         raw_names = (args.role, args.permission)
     elif args.command == "list-permissions":
@@ -153,7 +162,13 @@ def main(argv=None):
     try:
         try:
             if args.command == "export-rules":
-                rules = store.list_all_rules(conn)
+                # --role 缺省（规整后目标名为 None）时沿用全量导出；
+                # 指定角色时只取该角色当前保存的授权，角色无任何授权
+                # （含角色从未出现、授权已全部撤销、空库）时 rules 为空。
+                if target_name is None:
+                    rules = store.list_all_rules(conn)
+                else:
+                    rules = store.list_rules_for_role(conn, target_name)
                 result = {
                     "rules": [
                         {"role": role, "permission": permission}

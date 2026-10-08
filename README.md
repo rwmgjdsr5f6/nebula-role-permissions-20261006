@@ -92,6 +92,24 @@ $ python -m rbac --db rules.db list-member-permissions alice --explain
 
 来源只包含成员固定绑定、且确实获授对应权限的角色。上例中即使 `editor` 也获授了 `documents:read`，由于 `alice` 只固定绑定 `reader`，`sources` 中不会出现 `editor`；撤销 `reader` 的这条授权后，`permissions` 与 `sources` 均为空，而 `roles` 仍为 `["reader"]`。未配置的成员（如 `bob` 或大小写不同的 `Alice`）返回空的 `roles`、`permissions`、`sources`。不带 `--explain` 时输出保持 `member`、`roles`、`permissions` 三个字段不变。权限名与角色名均去重，按完整名称的 Unicode 码点升序排列，保存值、大小写与内部空白原样保留，`*`、`%`、`_` 均为普通字符。
 
+## 导出授权规则
+
+`export-rules` 导出库中现存的全部直接角色授权，输出为 `{"rules":[...]}`，每项仅含 `role` 和 `permission`，先按角色名再按权限名的 Unicode 码点升序排列：
+
+```console
+$ python -m rbac --db rules.db export-rules
+{"rules":[{"role":"editor","permission":"documents:read"},{"role":"reader","permission":"documents:read"},{"role":"reader","permission":"documents:write"}]}
+```
+
+加上可选的 `--role ROLE` 后，只导出指定角色当前保存的授权片段：每项仍仅含 `role` 和 `permission`，权限按完整名称的 Unicode 码点升序排列，其他角色的授权不出现。角色即使没有绑定固定成员，只要存在授权也正常导出。
+
+```console
+$ python -m rbac --db rules.db export-rules --role reader
+{"rules":[{"role":"reader","permission":"documents:read"},{"role":"reader","permission":"documents:write"}]}
+```
+
+角色名沿用统一名称规则：先去除首尾空白，再按完整名称大小写敏感精确匹配，保留内部空白，`*`、`%`、`_` 均为普通字符。角色未出现、授权已全部撤销或规则库为空时返回 `{"rules":[]}`（退出码 0）；空字符串或纯空白角色名返回退出码 2 与 `{"error":"invalid_name"}`，且校验先于任何数据库操作。不带 `--role` 时全量导出的内容、排序、格式与退出码保持不变。导出为只读操作，规则不变时重复导出结果一致。
+
 ## 名称规则
 
 所有成员名、角色名、权限名先去除首尾空白，再按完整字符串做**大小写敏感**的精确匹配。
@@ -116,7 +134,7 @@ python -m rbac --db FILE list-role-members ROLE
 python -m rbac --db FILE list-member-permissions MEMBER [--explain]
 python -m rbac --db FILE list-roles
 python -m rbac --db FILE list-all-permissions
-python -m rbac --db FILE export-rules
+python -m rbac --db FILE export-rules [--role ROLE]
 ```
 
 所有命令成功时退出码为 0，标准输出为一行 JSON；退出码 2 与 1 的含义见上节。
